@@ -1,0 +1,24 @@
+# Plan de déploiement Render (facultatif : le service peut aussi être créé à la main). Les secrets ne sont JAMAIS dans ce fichier.
+services:
+  - type: web
+    name: fynx-engine
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: SUPABASE_URL
+        value: https://gircvhlzgyajpvipsykn.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: WALLET_ENCRYPTION_KEY
+        sync: false
+      - key: SOLANA_RPC_URL
+        sync: false
+      - key: JUPITER_API_KEY
+        sync: false
