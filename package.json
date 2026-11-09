@@ -1,0 +1,15 @@
+{
+  "name": "fynx-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serveur du moteur FYNX (trading autonome de memecoins Solana) : boucle continue de 5 s, Supabase comme base.",
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "start": "node src/server.ts",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0"
+  }
+}
