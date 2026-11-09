@@ -1,4 +1,6 @@
 # Plan de déploiement Render (facultatif : le service peut aussi être créé à la main). Les secrets ne sont JAMAIS dans ce fichier.
+# À la création, Render demande la valeur des deux secrets indispensables (sync: false).
+# SOLANA_RPC_URL et JUPITER_API_KEY (facultatives) s'ajoutent ensuite dans Render > Environment.
 services:
   - type: web
     name: fynx-engine
@@ -8,7 +10,7 @@ services:
     buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /health
-    autoDeploy: true
+    autoDeployTrigger: commit
     envVars:
       - key: NODE_VERSION
         value: "22.23.4"
@@ -17,8 +19,4 @@ services:
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: WALLET_ENCRYPTION_KEY
-        sync: false
-      - key: SOLANA_RPC_URL
-        sync: false
-      - key: JUPITER_API_KEY
         sync: false
