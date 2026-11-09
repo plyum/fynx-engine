@@ -7,9 +7,10 @@
   "engines": { "node": ">=22.18" },
   "scripts": {
     "start": "node src/server.ts",
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts",
+    "sync": "bash scripts/sync-engine.sh"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.0.0"
+    "@supabase/supabase-js": "^2.119.0"
   }
 }
