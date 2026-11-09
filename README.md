@@ -13,6 +13,9 @@ La base de données, la connexion et les portefeuilles chiffrés restent dans Su
   (déclenchée par pg_cron toutes les 30 s) reste en **secours** : si ce serveur tombe, elle reprend au bout de 120 s au plus.
 
 ## Variables d'environnement (à saisir dans Render → Environment, jamais dans le code ni dans le chat)
+À la création par Blueprint (`render.yaml`), Render ne demande que les deux secrets indispensables (`SUPABASE_SERVICE_ROLE_KEY`,
+`WALLET_ENCRYPTION_KEY`). `SOLANA_RPC_URL` et `JUPITER_API_KEY` s'ajoutent ensuite dans Render → Environment (le service redémarre).
+
 | Nom | Obligatoire | Rôle |
 |---|---|---|
 | `SUPABASE_URL` | oui | adresse du projet Supabase |
