@@ -1,11 +1,12 @@
 # Plan de déploiement Render (facultatif : le service peut aussi être créé à la main). Les secrets ne sont JAMAIS dans ce fichier.
 # À la création, Render demande la valeur des deux secrets indispensables (sync: false).
 # SOLANA_RPC_URL et JUPITER_API_KEY (facultatives) s'ajoutent ensuite dans Render > Environment.
+# plan 0.5c-512mb = l'instance à 7 $/mois (0,5 CPU, 512 Mo), appelée « Starter » avant. Ne jamais mettre « free » : il s'endort.
 services:
   - type: web
     name: fynx-engine
     runtime: node
-    plan: starter
+    plan: 0.5c-512mb
     region: oregon
     buildCommand: npm install --omit=dev
     startCommand: npm start
