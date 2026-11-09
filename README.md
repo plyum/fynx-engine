@@ -5,7 +5,8 @@ que la fonction Supabase `tick`, mais **en boucle continue** (un tour toutes les
 La base de données, la connexion et les portefeuilles chiffrés restent dans Supabase.
 
 ## Comment ça marche
-- `src/engine/` : le moteur, **copié tel quel** depuis la fonction Supabase `tick` du projet FYNX (seule l'entrée HTTP de la fonction est retirée). Ne pas le modifier ici à la main : on change la source du projet FYNX puis on recopie.
+- `src/engine/` : le moteur, **copié depuis le projet principal** (`fynx/functions/tick`) par `bash scripts/sync-engine.sh`.
+  Ne jamais le modifier ici à la main : on change la source, on relance le script, on relance les tests du projet principal, puis on pousse ici.
 - `src/service.ts` : la boucle. Un tour toutes les 5 s, un tour complet (analyse, valorisation) toutes les 30 s.
 - `src/server.ts` : démarre la boucle, expose `GET /health`, s'arrête proprement sur SIGTERM (rend le verrou).
 - **Verrou Postgres** (`acquire_engine_lock`, renouvelé à chaque tour) : un seul moteur tourne à la fois. La fonction Supabase `tick`
@@ -21,10 +22,19 @@ La base de données, la connexion et les portefeuilles chiffrés restent dans Su
 | `JUPITER_API_KEY` | non | clé Jupiter gratuite |
 | `PORT` | non | fourni par Render |
 
+## Node
+Le serveur exécute les fichiers `.ts` directement, sans compilation : Node ≥ 22.18. La version exacte (22.23.4, celle des tests)
+est fixée dans `.node-version` et dans `render.yaml`. Les dépendances sont figées par `package-lock.json`.
+
 ## Tests
-`npm test` (Node ≥ 22.18) : tests de la boucle (horloge simulée) et test de fumée du vrai point d'entrée avec un faux Supabase.
-Les 117 tests du moteur lui-même sont dans le projet FYNX (ils passent aussi sur cette copie).
+`npm test` lance :
+- `test/service.test.ts` : la boucle avec une horloge simulée (cadence 5 s, tour complet toutes les 30 s, verrou, pannes, arrêt) ;
+- `test/smoke.test.ts` : le vrai point d'entrée `src/server.ts` avec un faux Supabase (démarrage, prise du verrou, `/health`, arrêt propre) ;
+- `test/real-client.test.ts` : le même point d'entrée avec le **vrai** `@supabase/supabase-js` (après `npm install`) face à un faux serveur d'API local
+  (requêtes HTTP réelles, verrou, tour du moteur, `/health`, arrêt propre). Ignoré si les dépendances ne sont pas installées.
+
+Les tests du moteur lui-même vivent dans le projet principal (`fynx/functions/tick`), là où le moteur est modifié.
 
 ## Limites connues
 - Le trading réel n'a jamais été exécuté avec de l'argent réel ; il n'est vérifié que contre de faux serveurs.
-- Les tests n'utilisent pas le vrai client `@supabase/supabase-js` : il est installé par `npm install` au déploiement.
+- Aucun test ne parle à la vraie base Supabase ni aux vraies API (DexScreener, RugCheck, Jupiter, Solana) : ils sont simulés.
