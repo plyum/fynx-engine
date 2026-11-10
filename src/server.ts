@@ -38,7 +38,7 @@ const teamCfg = teamConfigFromEnv({
   AI_TEAM: process.env['AI_TEAM'], AI_SELL_MIN_CONFIDENCE: process.env['AI_SELL_MIN_CONFIDENCE'], AI_SELL_REVIEW_MIN: process.env['AI_SELL_REVIEW_MIN'],
   AI_SELL_BUDGET_SHARE: process.env['AI_SELL_BUDGET_SHARE'], AI_MAX_PER_SCAN: process.env['AI_MAX_PER_SCAN'],
 });
-const aiTeam = aiGate && teamCfg.enabled ? createTeam(aiGate.core, teamCfg, createCandleSource((u, i) => fetch(u, i))) : null;
+const aiTeam = aiGate && teamCfg.enabled ? createTeam(aiGate.core, teamCfg, createCandleSource((u, i) => fetch(u, i), Date.now, { minGapMs: 2_500 })) : null;
 log(aiCfg
   ? `Agent IA actif : ${aiCfg.model}, veto ${aiCfg.veto ? `actif (confiance ≥ ${aiCfg.minConfidence} %)` : 'coupé (avis seulement)'}, budget ${aiCfg.monthlyBudgetUsd} $/mois. `
     + (aiTeam ? `Équipe IA active : 3 analystes + 2 contrôleurs (vente papier si confiance ≥ ${teamCfg.sellMinConfidence} %).` : 'Équipe IA coupée (AI_TEAM=off) : Analyste Contrat seul.')

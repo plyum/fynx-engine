@@ -134,13 +134,26 @@ const CANDLE_TTL_MS = 45_000;
 const CANDLE_TIMEOUT_MS = 6_000;
 const RATE_LIMIT_PAUSE_MS = 60_000;
 
-/** Source de bougies avec cache court, requêtes dédoublonnées et pause d'une minute après un « trop de requêtes » (429). */
-export function createCandleSource(get: GetLike, now: () => number = Date.now) {
+/**
+ * Source de bougies avec cache court, requêtes dédoublonnées, espacement minimal entre deux requêtes (`minGapMs` : l'API gratuite
+ * de GeckoTerminal tolère environ 30 requêtes par minute) et pause d'une minute après un « trop de requêtes » (429).
+ */
+export function createCandleSource(get: GetLike, now: () => number = Date.now, opts: { minGapMs?: number } = {}) {
   const cache = new Map<string, { at: number; candles: Candle[] }>();
   const inflight = new Map<string, Promise<CandleResult>>();
   let pausedUntil = 0;
+  const gap = Math.max(0, opts.minGapMs ?? 0);
+  let nextSlot = 0;
 
   async function fetchOnce(pool: string, agg: number, limit: number): Promise<CandleResult> {
+    if (gap > 0) {
+      // Plusieurs positions revues en même temps : les requêtes partent les unes après les autres au lieu d'arriver en rafale.
+      const t = Date.now();
+      const wait = Math.max(0, nextSlot - t);
+      nextSlot = Math.max(t, nextSlot) + gap;
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (now() < pausedUntil) return { ok: false, error: 'GeckoTerminal en pause (trop de requêtes)' };
+    }
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), CANDLE_TIMEOUT_MS);
     try {
