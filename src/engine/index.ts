@@ -9,6 +9,7 @@ import {
 } from './lib.ts';
 import { makeRpc, SOL_MINT, type Rpc } from './solana.ts';
 import { makeJupiter, type Jupiter } from './jupiter.ts';
+import { aiConfigFromEnv, buildAiInput, createAiGate, type AiGate, type AiResult } from './ai.ts';
 import { buyToken, fetchUsdPrice, refreshBalances, sellPosition } from './live.ts';
 import {
   LIVE_DEADLINE_MS, canSell, entryGate, exitSlippageBps, liveGate, liveValue, openSession, secretUsable, tidyUp,
@@ -21,6 +22,8 @@ const RISK_TTL_MS = 10 * 60_000;
 const MAX_DEEP_CHECKS = 4;
 const MAX_ENTRIES_PER_TICK = 2;
 const MAX_CANDIDATES = 12;
+/** Temps maximal d'attente de l'IA par tour : un modèle lent ne doit jamais retarder les stops (le tour est séquentiel). */
+export const AI_TICK_BUDGET_MS = 12_000;
 // Garde-fou contre deux déclenchements quasi simultanés : très court, car le verrou Postgres protège déjà du chevauchement
 // et un appel du cron ne doit jamais être refusé parce que le précédent vient de finir.
 const MIN_TICK_GAP_MS = 1_000;
@@ -58,6 +61,10 @@ export type Ctx = {
   deadline: number;
   live: Map<string, { S: Session } | { error: string }>;
   solPrice?: Promise<number | null>;
+  /** Agent « Analyste IA » (veto sur les entrées déjà acceptées par les règles) ; absent = règles seules. */
+  ai?: AiGate | null;
+  /** Temps déjà passé à attendre l'IA pendant ce tour (ms) : au-delà de AI_TICK_BUDGET_MS, on n'attend plus (les règles décident seules). */
+  aiMs?: number;
   /** Accès réseau du compte réel, injectables pour les tests. */
   deps: { makeRpc: (url: string) => Rpc; makeJup: (apiKey?: string) => Jupiter; fetchPrice: (mint: string) => Promise<number | null> };
 };
@@ -685,7 +692,33 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
             if (!(await recentlyLogged(ctx, a.id, 'warning', 'Entrée impossible', 30))) ev(ctx, a.id, 'warning', 'SIZER', `Entrée impossible sur ${sym} : liquidités insuffisantes ou plafond atteint (cash ${cash.toFixed(2)} $).`);
             break;
           }
-          ev(ctx, a.id, 'info', 'ANALYST', `ANALYSE ${sym} — ${dec.reasons[0]}`, { step: 'ANALYSE', mint: c.mint, risk_score: rk.risk.score });
+          // Agent IA : il ne peut que bloquer. Toute panne (clé, réseau, budget, réponse illisible) = pas d'avis, les règles décident seules.
+          let aiNote = '';
+          let aiData: Record<string, unknown> | undefined;
+          if (ctx.ai) {
+            let r: AiResult;
+            if ((ctx.aiMs ?? 0) >= AI_TICK_BUDGET_MS) r = { ok: false, reason: 'paused', detail: `temps d’attente de l’IA épuisé pour ce tour (${AI_TICK_BUDGET_MS / 1000} s)` };
+            else {
+              const t0 = Date.now();
+              r = await ctx.ai.review(buildAiInput(c.mint, c.pair, rk.risk, t0))
+                .catch((e): AiResult => ({ ok: false, reason: 'error', detail: String((e as Error)?.message ?? e).slice(0, 160) }));
+              ctx.aiMs = (ctx.aiMs ?? 0) + (Date.now() - t0);
+            }
+            if (r.ok) {
+              const v = r.review;
+              aiData = { verdict: v.verdict, confidence: v.confidence, red_flags: v.red_flags, cached: v.cached, model: v.model };
+              if (v.veto) {
+                if (!(await recentlyLogged(ctx, a.id, 'filtered', `VETO IA ${sym} —`, 15))) {
+                  ev(ctx, a.id, 'filtered', 'ANALYST', `VETO IA ${sym} — ${v.reasons || v.red_flags.join(' ; ') || 'risque jugé trop élevé'} (confiance ${v.confidence} %)`, { step: 'IA', mint: c.mint, ...aiData, reasons: v.reasons, vetoed: true });
+                }
+                continue;
+              }
+              aiNote = ` · IA : ${v.verdict === 'ok' ? 'rien d’anormal' : v.verdict === 'avoid' ? 'prudence (non bloquant)' : 'avis incertain'} (${v.confidence} %)`;
+            } else if (!(await recentlyLogged(ctx, a.id, 'warning', 'Agent IA indisponible', 30))) {
+              ev(ctx, a.id, 'warning', 'ANALYST', `Agent IA indisponible : ${r.detail}. Les règles habituelles s’appliquent seules.`);
+            }
+          }
+          ev(ctx, a.id, 'info', 'ANALYST', `ANALYSE ${sym} — ${dec.reasons[0]}${aiNote}`, { step: 'ANALYSE', mint: c.mint, risk_score: rk.risk.score, ...(aiData ? { ai: aiData } : {}) });
           ev(ctx, a.id, 'info', 'SIZER', `TAILLE ${sym} — ${usd.toFixed(2)} $ (${s.position_size_pct} % de l’équité, plafond ${maxTrade} $, ${openCount + 1}/${s.max_positions} positions)`, { step: 'SIZE', mint: c.mint, usd });
           if (live) {
             liveOrders++;
