@@ -10,7 +10,11 @@ import {
 import { buildScanRow, type ScanAi, type ScanItem } from './scan.ts';
 import { makeRpc, SOL_MINT, type Rpc } from './solana.ts';
 import { makeJupiter, type Jupiter } from './jupiter.ts';
-import { aiConfigFromEnv, buildAiInput, createAiGate, type AiGate, type AiResult } from './ai.ts';
+import { aiConfigFromEnv, buildAiInput, createAiGate, type AiGate, type AiInput, type GateResult } from './ai.ts';
+import {
+  AGENT_BUYER, AGENT_CHART, AGENT_CONTRACT, AGENT_MARKET, AGENT_SELLER, TEAM_AGENTS, TEAM_KEYS, TEAM_LABELS, noteOf,
+  type AgentStats, type Held, type Note, type Prepared, type Team,
+} from './aiteam.ts';
 import { buyToken, fetchUsdPrice, refreshBalances, sellPosition } from './live.ts';
 import {
   LIVE_DEADLINE_MS, canSell, entryGate, exitSlippageBps, liveGate, liveValue, openSession, secretUsable, tidyUp,
@@ -47,7 +51,7 @@ type Acct = { id: string; label: string; mode: 'paper' | 'live'; initial: number
 type Pos = {
   id: string; account_id: string; mint: string; status: 'open' | 'closing'; entry_price: number; qty: number; size_usd: number;
   stop_price: number | null; take_profit_price: number | null; trailing_pct: number | null; peak_price: number | null;
-  risk_score: number | null;
+  risk_score: number | null; opened_at: number | null;
 };
 type Plan = { a: Acct; prev: BotStatus; next: BotStatus; resetRequested?: Requested; pending?: boolean };
 type Cand = { mint: string; pair: Pair; rank: number };
@@ -66,6 +70,8 @@ export type Ctx = {
   ai?: AiGate | null;
   /** Temps déjà passé à attendre l'IA pendant ce tour (ms) : au-delà de AI_TICK_BUDGET_MS, on n'attend plus (les règles décident seules). */
   aiMs?: number;
+  /** Équipe IA (analystes Graphique et Marché, contrôleurs d'achat et de vente) ; absente = Analyste Contrat seul. */
+  team?: Team | null;
   /** Accès réseau du compte réel, injectables pour les tests. */
   deps: { makeRpc: (url: string) => Rpc; makeJup: (apiKey?: string) => Jupiter; fetchPrice: (mint: string) => Promise<number | null> };
 };
@@ -86,6 +92,23 @@ function ag(ctx: Ctx, accountId: string, u: AgentUpdate) {
   const l = ctx.agents.get(accountId) ?? [];
   l.push(u);
   ctx.agents.set(accountId, l);
+}
+
+const aiOn = (a: Acct, agent: string) => a.set.agents_enabled?.[TEAM_KEYS[agent]] !== false;
+
+/** Attend un avis de l'IA sans dépasser le temps d'attente du tour (AI_TICK_BUDGET_MS) ; au-delà : « pas d'avis ». */
+async function aiWait<T extends { ok: boolean }>(ctx: Ctx, p: Promise<T>): Promise<T | { ok: false; reason: 'paused'; detail: string }> {
+  const left = AI_TICK_BUDGET_MS - (ctx.aiMs ?? 0);
+  const late = { ok: false as const, reason: 'paused' as const, detail: `temps d’attente de l’IA épuisé pour ce tour (${AI_TICK_BUDGET_MS / 1000} s)` };
+  if (left <= 0) return late;
+  const t0 = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([p, new Promise<typeof late>((res) => { timer = setTimeout(() => res(late), left); })]);
+  } finally {
+    clearTimeout(timer);
+    ctx.aiMs = (ctx.aiMs ?? 0) + (Date.now() - t0);
+  }
 }
 
 // ───────────────────────── Réseau (avec mesure de santé des API) ─────────────────────────
@@ -167,6 +190,7 @@ function toPos(r: Record<string, unknown>): Pos {
     take_profit_price: r.take_profit_price === null ? null : num(r.take_profit_price),
     trailing_pct: r.trailing_pct === null ? null : num(r.trailing_pct), peak_price: r.peak_price === null ? null : num(r.peak_price),
     risk_score: r.risk_score === null ? null : num(r.risk_score),
+    opened_at: typeof r.opened_at === 'string' && Number.isFinite(Date.parse(r.opened_at)) ? Date.parse(r.opened_at) : null,
   };
 }
 
@@ -526,6 +550,26 @@ export async function runTick(ctx: Ctx, opts: { full?: boolean } = {}) {
     if (snaps.length) await sb.from('token_snapshots').insert(snaps);
   }
 
+  // 4 bis) Équipe IA : les analystes lisent, une fois par scan et pour tous les comptes, les jetons que les règles d'au moins un compte
+  // acceptent — AVANT la taille de position, donc même si les positions sont pleines. Rien n'est attendu ici : les appels tournent
+  // pendant que les sorties sont traitées, et l'achat lit leurs avis plus bas.
+  const pre = new Map<string, { prepared: Prepared; ai: AiInput; price: number }>();
+  if (ctx.team && cands.length) {
+    for (const c of cands) {
+      if (pre.size >= ctx.team.cfg.maxPerScan) break;
+      const rk = riskMap.get(c.mint);
+      if (!rk) continue;
+      const fans = scanners.filter((p) => evaluateEntry(c.pair, rk.risk, { max_risk_score: p.a.set.max_risk_score, caution_level: p.a.set.caution_level }, Date.now() - ctx.pairsAt).ok
+        && !(open.get(p.a.id) ?? []).some((x) => x.mint === c.mint));
+      if (!fans.length) continue;
+      const on = { contract: !!ctx.ai && fans.some((p) => aiOn(p.a, AGENT_CONTRACT)), chart: fans.some((p) => aiOn(p.a, AGENT_CHART)), market: fans.some((p) => aiOn(p.a, AGENT_MARKET)) };
+      const ai = buildAiInput(c.mint, c.pair, rk.risk, Date.now());
+      const gate = ctx.ai;
+      pre.set(c.mint, { ai, price: num(c.pair.priceUsd), prepared: ctx.team.analyze({ mint: c.mint, pair: c.pair, ai }, on, gate ? () => gate.review(ai) : null) });
+    }
+  }
+  const teamStats = ctx.team && full ? ctx.team.drainStats() : null;
+
   // Instantanés de prix des positions ouvertes (historique réel pour la fiche token)
   const posSnaps: Record<string, unknown>[] = [];
   for (const m of posMints) {
@@ -543,7 +587,7 @@ export async function runTick(ctx: Ctx, opts: { full?: boolean } = {}) {
     try {
       const info = await processAccount(ctx, p, open.get(a.id) ?? [], pairs, {
         scanDue, full, cands, riskMap, discoveredCount: discovered.length, feedsOk, deepAttempts, deepFailures,
-        blockedBy: entryBlockedBy.get(a.id) ?? null, pairsFailed: ctx.health['dexscreener_tokens']?.ok === false,
+        blockedBy: entryBlockedBy.get(a.id) ?? null, pairsFailed: ctx.health['dexscreener_tokens']?.ok === false, pre, teamStats,
       });
       orders += Number(info.orders ?? 0);
       perAccount.push({ account: a.label, ...info });
@@ -555,6 +599,37 @@ export async function runTick(ctx: Ctx, opts: { full?: boolean } = {}) {
     }
   }
 
+  // 5 bis) Contrôleur de vente : avis en arrière-plan sur les positions PAPIER ouvertes (jamais le compte réel) ; le tour n'attend pas.
+  if (ctx.team) {
+    const byMint = new Map<string, { list: Pos[]; set: Settings }>();
+    for (const p of plans) {
+      if (p.a.mode !== 'paper' || (p.next !== 'running' && p.next !== 'paused') || !aiOn(p.a, AGENT_SELLER)) continue;
+      for (const pos of open.get(p.a.id) ?? []) {
+        if (pos.status !== 'open') continue;
+        const e = byMint.get(pos.mint) ?? { list: [], set: p.a.set };
+        e.list.push(pos);
+        byMint.set(pos.mint, e);
+      }
+    }
+    const held: Held[] = [];
+    for (const [mint, { list, set }] of byMint) {
+      const pair = pairs.get(mint);
+      const price = num(pair?.priceUsd);
+      const size = list.reduce((s, x) => s + x.size_usd, 0);
+      const qty = list.reduce((s, x) => s + x.qty, 0);
+      if (!pair || !(price > 0) || !(qty > 0)) continue;
+      held.push({
+        mint, symbol: symOf(ctx, mint, pair), pairAddress: pair.pairAddress ?? null, positions: list.length, entry_price: size / qty, price_usd: price,
+        held_min: Math.max(0, ...list.map((x) => (x.opened_at ? (Date.now() - x.opened_at) / 60_000 : 0))), peak_price: Math.max(...list.map((x) => x.peak_price ?? x.entry_price)),
+        stop_loss_pct: set.stop_loss_pct, take_profit_pct: set.take_profit_pct, trailing_pct: set.trailing_stop_pct,
+        liquidity_usd: pair.liquidity?.usd ?? null, volume_24h: pair.volume?.h24 ?? null,
+        txns: { m5: pair.txns?.m5, h1: pair.txns?.h1, h24: pair.txns?.h24 },
+        price_change_pct: { m5: pair.priceChange?.m5, h1: pair.priceChange?.h1, h6: pair.priceChange?.h6, h24: pair.priceChange?.h24 },
+      });
+    }
+    ctx.team.watchPositions(held);
+  }
+
   // 6) Santé des API + horloges du moteur
   const rows = Object.entries(ctx.health).map(([service, h]) => ({ service, ...h, checked_at: nowIso }));
   if (scanDue) rows.push({ service: 'engine_scan', ok: feedsOk > 0, latency_ms: Date.now() - t0, http_status: 200, error: null, checked_at: nowIso });
@@ -564,6 +639,8 @@ export async function runTick(ctx: Ctx, opts: { full?: boolean } = {}) {
 
   return { accounts: accts.length, active: active.length, scanned: scanDue, discovered: discovered.length, candidates: cands.length, deep_checked: deepAttempts, orders, perAccount };
 }
+
+const verdictFr = (v: string) => (v === 'ok' ? 'rien d’anormal' : v === 'avoid' ? 'prudence' : v === 'sell' ? 'vendre' : v === 'hold' ? 'garder' : 'incertain');
 
 /** Raison courte d'un veto de l'IA pour l'affichage (le texte complet reste dans le journal). */
 function scanVetoNote(reasons: string, flags: string[]): string {
@@ -585,6 +662,10 @@ type Shared = {
   scanDue: boolean; full: boolean; cands: Cand[]; riskMap: Map<string, { risk: RiskResult; fresh: boolean }>;
   discoveredCount: number; feedsOk: number; deepAttempts: number; deepFailures: number;
   blockedBy: string | null; pairsFailed: boolean;
+  /** Avis des analystes lancés pour ce scan (équipe IA), par jeton. */
+  pre?: Map<string, { prepared: Prepared; ai: AiInput; price: number }>;
+  /** Compteurs de l'équipe IA depuis le dernier tour complet. */
+  teamStats?: Record<string, AgentStats> | null;
 };
 
 async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<string, Pair>, sh: Shared) {
@@ -640,7 +721,15 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
         if (done) orders++;
       }
       else if (ex.action === 'stale') stale++;
-      else if (ex.peak > (pos.peak_price ?? pos.entry_price)) await sb.from('positions').update({ peak_price: ex.peak }).eq('id', pos.id);
+      else {
+        if (ex.peak > (pos.peak_price ?? pos.entry_price)) await sb.from('positions').update({ peak_price: ex.peak }).eq('id', pos.id);
+        // Contrôleur de vente IA : comptes PAPIER uniquement, avis récent et prix proche de celui de l'avis. Les stops restent prioritaires.
+        const sig = ctx.team && a.mode === 'paper' && hasPrice && aiOn(a, AGENT_SELLER) ? ctx.team.sellSignal(pos.mint, price) : null;
+        if (sig?.act) {
+          const why = `Contrôleur de vente IA : ${(sig.reasons || sig.red_flags.join(' ; ') || 'retournement repéré').slice(0, 160)} (confiance ${sig.confidence} %)`;
+          if (await sell(ctx, a, pos, pair!, why)) { orders++; ag(ctx, a.id, { agent: AGENT_SELLER, status: 'RUNNING' }); }
+        }
+      }
     }
     if (stale > 0 && !(await recentlyLogged(ctx, a.id, 'warning', 'Prix indisponible', 10))) {
       ev(ctx, a.id, 'warning', 'EXECUTOR', `Prix indisponible pour ${stale} position(s) : stop loss / take profit non évaluables ce tick (la position n’est PAS vendue à l’aveugle).`);
@@ -729,17 +818,19 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
           let aiNote = '';
           let aiData: Record<string, unknown> | undefined;
           let aiScan: ScanAi | undefined;
+          let contractNote: Note | null = null;
           if (ctx.ai) {
-            let r: AiResult;
+            let r: GateResult;
             if ((ctx.aiMs ?? 0) >= AI_TICK_BUDGET_MS) r = { ok: false, reason: 'paused', detail: `temps d’attente de l’IA épuisé pour ce tour (${AI_TICK_BUDGET_MS / 1000} s)` };
             else {
               const t0 = Date.now();
               r = await ctx.ai.review(buildAiInput(c.mint, c.pair, rk.risk, t0))
-                .catch((e): AiResult => ({ ok: false, reason: 'error', detail: String((e as Error)?.message ?? e).slice(0, 160) }));
+                .catch((e): GateResult => ({ ok: false, reason: 'error', detail: String((e as Error)?.message ?? e).slice(0, 160) }));
               ctx.aiMs = (ctx.aiMs ?? 0) + (Date.now() - t0);
             }
             if (r.ok) {
               const v = r.review;
+              contractNote = noteOf(v);
               aiData = { verdict: v.verdict, confidence: v.confidence, red_flags: v.red_flags, cached: v.cached, model: v.model };
               aiScan = { s: v.veto ? 'veto' : v.verdict, c: v.confidence };
               if (v.veto) {
@@ -756,6 +847,46 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
                 ev(ctx, a.id, 'warning', 'ANALYST', `Agent IA indisponible : ${r.detail}. Les règles habituelles s’appliquent seules.`);
               }
             }
+          }
+          // Équipe IA : avis des analystes Graphique et Marché (lancés au début du scan), puis le contrôleur d'achat. Ils ne peuvent que bloquer.
+          const prep = ctx.team ? sh.pre?.get(c.mint) : undefined;
+          if (ctx.team && prep) {
+            const notes: { contract: Note | null; chart: Note | null; market: Note | null } = { contract: contractNote, chart: null, market: null };
+            const said: string[] = [];
+            let veto: { agent: string; v: { verdict: string; confidence: number; reasons: string; red_flags: string[] } } | null = null;
+            for (const [agent, k, pr] of [[AGENT_CHART, 'chart', prep.prepared.chart], [AGENT_MARKET, 'market', prep.prepared.market]] as const) {
+              if (!pr || !aiOn(a, agent)) continue;
+              const r = await aiWait(ctx, pr);
+              if (!r.ok) continue;                     // pas d'avis : rien n'est bloqué
+              notes[k] = noteOf(r.review);
+              said.push(`${TEAM_LABELS[agent].replace('Analyste ', '')} : ${verdictFr(r.review.verdict)} (${r.review.confidence} %)`);
+              if (r.review.act && !veto) veto = { agent, v: r.review };
+            }
+            if (!veto && aiOn(a, AGENT_BUYER)) {
+              const px = num(c.pair.priceUsd), at = ctx.team.analysisPrice(c.mint), liq = num(c.pair.liquidity?.usd);
+              const r = await aiWait(ctx, ctx.team.controlBuy({
+                mint: c.mint, symbol: prep.ai.symbol,
+                order: { usd: Number(usd.toFixed(2)), pct_of_equity: s.position_size_pct, positions_after: openCount + 1, max_positions: s.max_positions, stop_loss_pct: s.stop_loss_pct, take_profit_pct: s.take_profit_pct, order_vs_liquidity_pct: liq > 0 ? Number(((usd / liq) * 100).toFixed(3)) : null },
+                rules: { risk_score: rk.risk.score, level: rk.risk.level, accepted_because: dec.reasons[0] ?? '' },
+                now: { price_usd: px > 0 ? px : null, liquidity_usd: liq > 0 ? liq : null, price_change_pct: prep.ai.price_change_pct, price_move_since_analysis_pct: at && px > 0 ? Number((((px / at) - 1) * 100).toFixed(1)) : null },
+                analysts: notes, risk_score: rk.risk.score,
+              }));
+              if (r.ok) {
+                said.push(`Contrôle : ${verdictFr(r.review.verdict)} (${r.review.confidence} %)`);
+                if (r.review.act) veto = { agent: AGENT_BUYER, v: r.review };
+                else if (!aiScan) aiScan = { s: r.review.verdict, c: r.review.confidence };
+              }
+            }
+            if (veto) {
+              const label = TEAM_LABELS[veto.agent];
+              scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: 'ai', note: `${label} : ${scanVetoNote(veto.v.reasons, veto.v.red_flags)}`, ai: { s: 'veto', c: veto.v.confidence } });
+              if (!(await recentlyLogged(ctx, a.id, 'filtered', `VETO IA ${sym} —`, 15))) {
+                ev(ctx, a.id, 'filtered', veto.agent, `VETO IA ${sym} — ${label} : ${veto.v.reasons || veto.v.red_flags.join(' ; ') || 'risque jugé trop élevé'} (confiance ${veto.v.confidence} %)`,
+                  { step: 'IA', mint: c.mint, agent: veto.agent, verdict: veto.v.verdict, confidence: veto.v.confidence, red_flags: veto.v.red_flags, reasons: veto.v.reasons, vetoed: true });
+              }
+              continue;
+            }
+            if (said.length) aiNote += ` · ${said.join(' · ')}`;
           }
           ev(ctx, a.id, 'info', 'ANALYST', `ANALYSE ${sym} — ${dec.reasons[0]}${aiNote}`, { step: 'ANALYSE', mint: c.mint, risk_score: rk.risk.score, ...(aiData ? { ai: aiData } : {}) });
           ev(ctx, a.id, 'info', 'SIZER', `TAILLE ${sym} — ${usd.toFixed(2)} $ (${s.position_size_pct} % de l’équité, plafond ${maxTrade} $, ${openCount + 1}/${s.max_positions} positions)`, { step: 'SIZE', mint: c.mint, usd });
@@ -808,11 +939,19 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
     else if (scanned && sh.feedsOk < 3) ag(ctx, a.id, { agent: 'SCANNER', status: 'WARNING', err: `${3 - sh.feedsOk} source(s) de découverte sur 3 indisponible(s).` });
     if (scanned && sh.deepAttempts > 0 && sh.deepFailures === sh.deepAttempts) ag(ctx, a.id, { agent: 'RUGCHECK', status: 'ERROR', err: 'RugCheck ne répond pas : aucun achat tant que le risque est inconnu.' });
     else if (scanned && sh.deepFailures > 0) ag(ctx, a.id, { agent: 'RUGCHECK', status: 'WARNING', err: `${sh.deepFailures} analyse(s) sans réponse RugCheck (token ignoré).` });
+    // Équipe IA : partagée entre les comptes, chaque compte affiche ses compteurs (appels facturés, dernière erreur).
+    for (const agent of TEAM_AGENTS) {
+      const on = aiOn(a, agent) && (agent === AGENT_CONTRACT ? !!ctx.ai : !!ctx.team) && (agent !== AGENT_SELLER || a.mode === 'paper');
+      const st = sh.teamStats?.[agent];
+      ag(ctx, a.id, { agent, status: !on ? 'IDLE' : st?.err ? 'WARNING' : 'RUNNING', n: on ? st?.ops ?? 0 : 0, err: on && st ? st.err : on ? undefined : null });
+    }
   } else if (status === 'paused' || status === 'closing') {
-    for (const k of ['SCANNER', 'RUGCHECK', 'ANALYST', 'SIZER']) ag(ctx, a.id, { agent: k, status: 'IDLE', err: null });
+    for (const k of ['SCANNER', 'RUGCHECK', 'ANALYST', 'SIZER', ...TEAM_AGENTS]) ag(ctx, a.id, { agent: k, status: 'IDLE', err: null });
     ag(ctx, a.id, { agent: 'EXECUTOR', status: 'RUNNING', err: null });
+    // Pause : plus d'entrées, mais les sorties continuent, y compris l'avis du contrôleur de vente (papier).
+    if (status === 'paused' && ctx.team && a.mode === 'paper' && aiOn(a, AGENT_SELLER)) ag(ctx, a.id, { agent: AGENT_SELLER, status: 'RUNNING', n: sh.teamStats?.[AGENT_SELLER]?.ops ?? 0 });
   } else if (p.prev !== 'stopped') {
-    for (const k of ['SCANNER', 'RUGCHECK', 'ANALYST', 'SIZER', 'EXECUTOR']) ag(ctx, a.id, { agent: k, status: 'IDLE', err: null });
+    for (const k of ['SCANNER', 'RUGCHECK', 'ANALYST', 'SIZER', 'EXECUTOR', ...TEAM_AGENTS]) ag(ctx, a.id, { agent: k, status: 'IDLE', err: null });
   }
   if (touchAgents && (status !== 'stopped' || p.prev !== 'stopped')) {
     if (st && (sh.pairsFailed || st.unpriced > 0) && status !== 'stopped') ag(ctx, a.id, { agent: 'EQUITY', status: 'WARNING', n: 1, err: 'Certains prix en direct sont indisponibles : valorisation au dernier prix connu.' });
