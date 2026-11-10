@@ -11,10 +11,11 @@ export const SCAN_ITEMS_MAX = 12;
 
 const SCAN_STOPS: readonly string[] = ['rules', 'size', 'ai', 'buy', 'skip'];
 const SCAN_AI: readonly string[] = ['ok', 'unsure', 'avoid', 'veto', 'down'];
+/** Contrôles, DEL et séparateurs de ligne Unicode (U+2028 / U+2029) : un texte venant d'une source externe n'en garde aucun. */
+const CTRL = new RegExp(`[\\x00-\\x1f\\x7f${String.fromCharCode(0x2028, 0x2029)}]+`, 'g');
 /** Texte court et sûr : sans retour à la ligne ni caractère de contrôle, borné. */
 export function scanText(v: unknown, max: number): string {
-  // deno-lint-ignore no-control-regex
-  return String(v ?? '').replace(/[\u0000-\u001f\u007f  ]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+  return String(v ?? '').replace(CTRL, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 }
 const scanInt = (v: unknown, lo: number, hi: number): number | null => {
   const x = Number(v);
