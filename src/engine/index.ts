@@ -7,6 +7,7 @@ import {
   riskFromRow, scanIsDue, scoreRisk, sellGate, simulateFill, sizePosition, toStoredFindings,
   type AgentUpdate, type BotStatus, type Pair, type Requested, type RiskResult,
 } from './lib.ts';
+import { buildScanRow, type ScanAi, type ScanItem } from './scan.ts';
 import { makeRpc, SOL_MINT, type Rpc } from './solana.ts';
 import { makeJupiter, type Jupiter } from './jupiter.ts';
 import { aiConfigFromEnv, buildAiInput, createAiGate, type AiGate, type AiResult } from './ai.ts';
@@ -564,6 +565,22 @@ export async function runTick(ctx: Ctx, opts: { full?: boolean } = {}) {
   return { accounts: accts.length, active: active.length, scanned: scanDue, discovered: discovered.length, candidates: cands.length, deep_checked: deepAttempts, orders, perAccount };
 }
 
+/** Raison courte d'un veto de l'IA pour l'affichage (le texte complet reste dans le journal). */
+function scanVetoNote(reasons: string, flags: string[]): string {
+  return reasons || (flags.length ? flags.join(' ; ') : 'Risque jugé trop élevé');
+}
+
+/** Note le sort des jetons du dernier scan. Informatif : une panne ici ne touche jamais le trading. */
+async function recordScan(ctx: Ctx, a: Acct, sh: Shared, items: ScanItem[], blocked: string | null) {
+  try {
+    const row = buildScanRow(a.id, { discovered: sh.discoveredCount, candidates: sh.cands.length, deep: sh.deepAttempts, deepFailed: sh.deepFailures }, items, blocked, new Date().toISOString());
+    const { error } = await ctx.sb.from('scan_state').upsert(row, { onConflict: 'account_id' });
+    if (error) console.warn(`scan_state: ${error.message}`);
+  } catch (e) {
+    console.warn(`scan_state: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+  }
+}
+
 type Shared = {
   scanDue: boolean; full: boolean; cands: Cand[]; riskMap: Map<string, { risk: RiskResult; fresh: boolean }>;
   discoveredCount: number; feedsOk: number; deepAttempts: number; deepFailures: number;
@@ -576,6 +593,9 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
   const s = a.set;
   let status: BotStatus = p.next;
   let orders = 0, entries = 0, stale = 0, stuck = 0, evaluated = 0, sized = 0;
+  // Sort de chaque jeton examiné pendant ce scan (affichage « analyse en cours », jamais relu par le moteur).
+  const scanItems: ScanItem[] = [];
+  let scanBlocked: string | null = null;
 
   // Compte réel : session (clé déchiffrée, réconciliation des ordres en attente, vrais soldes). Sans session, aucun ordre n'est tenté.
   // Pas de session (donc aucun accès réseau) pour un compte réel arrêté sans ordre en attente : seul l'état du bot est mis à jour.
@@ -666,6 +686,14 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
         ev(ctx, a.id, 'warning', 'SIZER', `Entrées réelles suspendues : ${gate.reason}.`);
       }
 
+      if (sh.scanDue) {
+        scanBlocked = sh.blockedBy ? `Entrées désactivées : l’agent ${sh.blockedBy} est désactivé dans les réglages`
+          : dailyBlocked ? `Limite de perte journalière atteinte (${lossPct.toFixed(1)} %) : aucun nouvel achat`
+          : gate && !gate.ok ? `Entrées réelles suspendues : ${gate.reason}`
+          : positions.length >= s.max_positions ? `Positions pleines (${positions.length}/${s.max_positions}) : aucun nouvel achat`
+          : null;
+      }
+
       if (sh.scanDue && !sh.blockedBy && !dailyBlocked && (!gate || gate.ok)) {
         let cash = st.cash, equity = st.equity, openCount = positions.length;
         const maxEntries = live ? 1 : MAX_ENTRIES_PER_TICK;       // réel : un achat à la fois (chaque ordre attend sa confirmation)
@@ -678,23 +706,29 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
         for (const c of sh.cands) {
           if (entries >= maxEntries || openCount >= s.max_positions) break;
           const rk = sh.riskMap.get(c.mint);
-          if (!rk || cooldown.has(c.mint) || positions.some((x) => x.mint === c.mint)) continue;
+          const sym = symOf(ctx, c.mint, c.pair);
+          if (!rk) { scanItems.push({ mint: c.mint, sym, score: null, stop: 'skip', note: 'Rapport de risque pas encore disponible (quelques analyses par tour)' }); continue; }
+          if (cooldown.has(c.mint)) { scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: 'skip', note: `Fermé il y a moins de ${REENTRY_COOLDOWN_MIN} min : pas de rachat immédiat` }); continue; }
+          if (positions.some((x) => x.mint === c.mint)) { scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: 'skip', note: 'Déjà en portefeuille' }); continue; }
           evaluated++;
           const dec = evaluateEntry(c.pair, rk.risk, { max_risk_score: s.max_risk_score, caution_level: s.caution_level }, Date.now() - ctx.pairsAt);
-          const sym = symOf(ctx, c.mint, c.pair);
           if (!dec.ok) {
+            scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: 'rules', note: dec.reasons[0] ?? 'Refusé par les règles' });
             if (rk.fresh) ev(ctx, a.id, 'filtered', 'ANALYST', `REJETÉ ${sym} — ${dec.reasons.join(' ; ')}`, { step: 'ANALYSE', mint: c.mint, risk_score: rk.risk.score, level: rk.risk.level, reasons: dec.reasons });
             continue;
           }
           const usd = sizePosition({ equity, cash, sizePct: s.position_size_pct, maxTradeUsd: maxTrade, openCount, maxPositions: s.max_positions });
           sized++;
           if (usd <= 0) {
+            const raw = Math.min((equity * s.position_size_pct) / 100, maxTrade, cash * 0.98);
+            scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: 'size', note: raw <= 1 ? `Position de ${Math.max(0, raw).toFixed(2)} $ : sous le minimum de 1 $` : 'Plafond de positions atteint' });
             if (!(await recentlyLogged(ctx, a.id, 'warning', 'Entrée impossible', 30))) ev(ctx, a.id, 'warning', 'SIZER', `Entrée impossible sur ${sym} : liquidités insuffisantes ou plafond atteint (cash ${cash.toFixed(2)} $).`);
             break;
           }
           // Agent IA : il ne peut que bloquer. Toute panne (clé, réseau, budget, réponse illisible) = pas d'avis, les règles décident seules.
           let aiNote = '';
           let aiData: Record<string, unknown> | undefined;
+          let aiScan: ScanAi | undefined;
           if (ctx.ai) {
             let r: AiResult;
             if ((ctx.aiMs ?? 0) >= AI_TICK_BUDGET_MS) r = { ok: false, reason: 'paused', detail: `temps d’attente de l’IA épuisé pour ce tour (${AI_TICK_BUDGET_MS / 1000} s)` };
@@ -707,15 +741,20 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
             if (r.ok) {
               const v = r.review;
               aiData = { verdict: v.verdict, confidence: v.confidence, red_flags: v.red_flags, cached: v.cached, model: v.model };
+              aiScan = { s: v.veto ? 'veto' : v.verdict, c: v.confidence };
               if (v.veto) {
+                scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: 'ai', note: scanVetoNote(v.reasons, v.red_flags), ai: aiScan });
                 if (!(await recentlyLogged(ctx, a.id, 'filtered', `VETO IA ${sym} —`, 15))) {
                   ev(ctx, a.id, 'filtered', 'ANALYST', `VETO IA ${sym} — ${v.reasons || v.red_flags.join(' ; ') || 'risque jugé trop élevé'} (confiance ${v.confidence} %)`, { step: 'IA', mint: c.mint, ...aiData, reasons: v.reasons, vetoed: true });
                 }
                 continue;
               }
               aiNote = ` · IA : ${v.verdict === 'ok' ? 'rien d’anormal' : v.verdict === 'avoid' ? 'prudence (non bloquant)' : 'avis incertain'} (${v.confidence} %)`;
-            } else if (!(await recentlyLogged(ctx, a.id, 'warning', 'Agent IA indisponible', 30))) {
-              ev(ctx, a.id, 'warning', 'ANALYST', `Agent IA indisponible : ${r.detail}. Les règles habituelles s’appliquent seules.`);
+            } else {
+              aiScan = { s: 'down' };
+              if (!(await recentlyLogged(ctx, a.id, 'warning', 'Agent IA indisponible', 30))) {
+                ev(ctx, a.id, 'warning', 'ANALYST', `Agent IA indisponible : ${r.detail}. Les règles habituelles s’appliquent seules.`);
+              }
             }
           }
           ev(ctx, a.id, 'info', 'ANALYST', `ANALYSE ${sym} — ${dec.reasons[0]}${aiNote}`, { step: 'ANALYSE', mint: c.mint, risk_score: rk.risk.score, ...(aiData ? { ai: aiData } : {}) });
@@ -724,16 +763,19 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
             liveOrders++;
             const r = await liveBuy(ctx, a, c, rk.risk, usd, dec.reasons[0], live);
             if (r.ok) { entries++; orders++; cash -= r.usd ?? usd; openCount++; }
+            scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: r.ok ? null : 'buy', note: r.ok ? `Acheté ${(r.usd ?? usd).toFixed(2)} $` : 'Achat non exécuté', ai: aiScan });
             if (r.halt) break;
           } else {
             const r = await buy(ctx, a, c, rk.risk, usd, dec.reasons[0]);
             if (r.ok) { entries++; orders++; cash -= usd; openCount++; }
+            scanItems.push({ mint: c.mint, sym, score: rk.risk.score, stop: r.ok ? null : 'buy', note: r.ok ? `Acheté ${usd.toFixed(2)} $` : 'Achat non exécuté', ai: aiScan });
           }
         }
         if (entries > 0 || liveOrders > 0) positions = [...(await loadOpenPositions(ctx, a.id)).values()].flat();
         if (live && liveOrders > 0) await refreshLive(ctx, a, live);
         st = await accountState(ctx, a, positions, pairs, live);
       }
+      if (sh.scanDue) await recordScan(ctx, a, sh, scanItems, scanBlocked);
     }
   }
 
