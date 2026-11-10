@@ -1,6 +1,7 @@
 // FYNX — serveur du moteur (Render). Même moteur que la fonction Supabase `tick`, mais en boucle continue.
 // Variables d'environnement : SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (obligatoires) ; WALLET_ENCRYPTION_KEY (comptes réels) ;
-// SOLANA_RPC_URL, JUPITER_API_KEY (facultatives) ; PORT (fourni par Render). Aucun secret n'est jamais journalisé.
+// SOLANA_RPC_URL, JUPITER_API_KEY (facultatives) ; ANTHROPIC_API_KEY (agent IA, facultative ; réglages AI_VETO, AI_MIN_CONFIDENCE,
+// AI_MONTHLY_BUDGET_USD, AI_MODEL) ; PORT (fourni par Render). Aucun secret n'est jamais journalisé.
 import { createServer } from 'node:http';
 import { hostname } from 'node:os';
 import { createClient } from '@supabase/supabase-js';
@@ -9,6 +10,7 @@ import { makeRpc } from './engine/solana.ts';
 import { makeJupiter } from './engine/jupiter.ts';
 import { fetchUsdPrice } from './engine/live.ts';
 import { LIVE_DEADLINE_MS } from './engine/livecycle.ts';
+import { aiConfigFromEnv, createAiGate } from './engine/ai.ts';
 import { newState, runService, type Lock } from './service.ts';
 
 const log = (m: string) => console.log(`${new Date().toISOString()} ${m}`);
@@ -21,6 +23,17 @@ if (!url || !key) {
 }
 const sb = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 if (!process.env['WALLET_ENCRYPTION_KEY']) log('WALLET_ENCRYPTION_KEY absent : les comptes réels resteront en pause (les comptes papier fonctionnent).');
+
+// Agent IA : une seule instance pour tout le processus (son cache et son compteur de budget doivent survivre d'un tour à l'autre).
+const aiCfg = aiConfigFromEnv({
+  ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'], AI_MODEL: process.env['AI_MODEL'], ANTHROPIC_VERSION: process.env['ANTHROPIC_VERSION'],
+  AI_VETO: process.env['AI_VETO'], AI_MIN_CONFIDENCE: process.env['AI_MIN_CONFIDENCE'], AI_MONTHLY_BUDGET_USD: process.env['AI_MONTHLY_BUDGET_USD'],
+  AI_PRICE_IN_PER_MTOK: process.env['AI_PRICE_IN_PER_MTOK'], AI_PRICE_OUT_PER_MTOK: process.env['AI_PRICE_OUT_PER_MTOK'],
+});
+const aiGate = aiCfg ? createAiGate(sb, aiCfg, { fetch: (u, i) => fetch(u, i) }) : null;
+log(aiCfg
+  ? `Agent IA actif : ${aiCfg.model}, veto ${aiCfg.veto ? `actif (confiance ≥ ${aiCfg.minConfidence} %)` : 'coupé (avis seulement)'}, budget ${aiCfg.monthlyBudgetUsd} $/mois.`
+  : 'Agent IA inactif (ANTHROPIC_API_KEY absent) : les règles décident seules.');
 
 // Propriétaire du verrou : unique pour cette copie du serveur (jamais « edge », réservé à la fonction Supabase de secours).
 const owner = `render-${hostname()}-${process.pid}-${Date.now().toString(36)}`;
@@ -43,7 +56,7 @@ const makeCtx = (start: number): Ctx => ({
     rpcUrl: process.env['SOLANA_RPC_URL'] || 'https://api.mainnet-beta.solana.com',
     jupKey: process.env['JUPITER_API_KEY'] || undefined,
   },
-  deadline: start + LIVE_DEADLINE_MS, live: new Map(),
+  deadline: start + LIVE_DEADLINE_MS, live: new Map(), ai: aiGate,
   deps: { makeRpc: (u) => makeRpc(u), makeJup: (k) => makeJupiter({ apiKey: k }), fetchPrice: (m) => fetchUsdPrice(m) },
 });
 
