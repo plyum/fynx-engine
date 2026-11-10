@@ -1,7 +1,8 @@
 // FYNX — serveur du moteur (Render). Même moteur que la fonction Supabase `tick`, mais en boucle continue.
 // Variables d'environnement : SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (obligatoires) ; WALLET_ENCRYPTION_KEY (comptes réels) ;
-// SOLANA_RPC_URL, JUPITER_API_KEY (facultatives) ; ANTHROPIC_API_KEY (agent IA, facultative ; réglages AI_VETO, AI_MIN_CONFIDENCE,
-// AI_MONTHLY_BUDGET_USD, AI_MODEL) ; PORT (fourni par Render). Aucun secret n'est jamais journalisé.
+// SOLANA_RPC_URL, JUPITER_API_KEY (facultatives) ; ANTHROPIC_API_KEY (équipe IA, facultative ; réglages AI_VETO, AI_MIN_CONFIDENCE,
+// AI_MONTHLY_BUDGET_USD, AI_MODEL, AI_TEAM, AI_SELL_MIN_CONFIDENCE, AI_SELL_REVIEW_MIN, AI_SELL_BUDGET_SHARE, AI_MAX_PER_SCAN) ;
+// PORT (fourni par Render). Aucun secret n'est jamais journalisé.
 import { createServer } from 'node:http';
 import { hostname } from 'node:os';
 import { createClient } from '@supabase/supabase-js';
@@ -11,6 +12,7 @@ import { makeJupiter } from './engine/jupiter.ts';
 import { fetchUsdPrice } from './engine/live.ts';
 import { LIVE_DEADLINE_MS } from './engine/livecycle.ts';
 import { aiConfigFromEnv, createAiGate } from './engine/ai.ts';
+import { createCandleSource, createTeam, teamConfigFromEnv } from './engine/aiteam.ts';
 import { newState, runService, type Lock } from './service.ts';
 
 const log = (m: string) => console.log(`${new Date().toISOString()} ${m}`);
@@ -31,8 +33,15 @@ const aiCfg = aiConfigFromEnv({
   AI_PRICE_IN_PER_MTOK: process.env['AI_PRICE_IN_PER_MTOK'], AI_PRICE_OUT_PER_MTOK: process.env['AI_PRICE_OUT_PER_MTOK'],
 });
 const aiGate = aiCfg ? createAiGate(sb, aiCfg, { fetch: (u, i) => fetch(u, i) }) : null;
+// Équipe IA (Graphique, Marché, contrôleurs d'achat et de vente) : même socle que l'Analyste Contrat (budget et coupe-circuit communs).
+const teamCfg = teamConfigFromEnv({
+  AI_TEAM: process.env['AI_TEAM'], AI_SELL_MIN_CONFIDENCE: process.env['AI_SELL_MIN_CONFIDENCE'], AI_SELL_REVIEW_MIN: process.env['AI_SELL_REVIEW_MIN'],
+  AI_SELL_BUDGET_SHARE: process.env['AI_SELL_BUDGET_SHARE'], AI_MAX_PER_SCAN: process.env['AI_MAX_PER_SCAN'],
+});
+const aiTeam = aiGate && teamCfg.enabled ? createTeam(aiGate.core, teamCfg, createCandleSource((u, i) => fetch(u, i))) : null;
 log(aiCfg
-  ? `Agent IA actif : ${aiCfg.model}, veto ${aiCfg.veto ? `actif (confiance ≥ ${aiCfg.minConfidence} %)` : 'coupé (avis seulement)'}, budget ${aiCfg.monthlyBudgetUsd} $/mois.`
+  ? `Agent IA actif : ${aiCfg.model}, veto ${aiCfg.veto ? `actif (confiance ≥ ${aiCfg.minConfidence} %)` : 'coupé (avis seulement)'}, budget ${aiCfg.monthlyBudgetUsd} $/mois. `
+    + (aiTeam ? `Équipe IA active : 3 analystes + 2 contrôleurs (vente papier si confiance ≥ ${teamCfg.sellMinConfidence} %).` : 'Équipe IA coupée (AI_TEAM=off) : Analyste Contrat seul.')
   : 'Agent IA inactif (ANTHROPIC_API_KEY absent) : les règles décident seules.');
 
 // Propriétaire du verrou : unique pour cette copie du serveur (jamais « edge », réservé à la fonction Supabase de secours).
@@ -56,7 +65,7 @@ const makeCtx = (start: number): Ctx => ({
     rpcUrl: process.env['SOLANA_RPC_URL'] || 'https://api.mainnet-beta.solana.com',
     jupKey: process.env['JUPITER_API_KEY'] || undefined,
   },
-  deadline: start + LIVE_DEADLINE_MS, live: new Map(), ai: aiGate,
+  deadline: start + LIVE_DEADLINE_MS, live: new Map(), ai: aiGate, team: aiTeam,
   deps: { makeRpc: (u) => makeRpc(u), makeJup: (k) => makeJupiter({ apiKey: k }), fetchPrice: (m) => fetchUsdPrice(m) },
 });
 
