@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 SRC="${1:-../fynx/functions/tick}"
 [ -f "$SRC/index.ts" ] || { echo "Source introuvable : $SRC" >&2; exit 1; }
 rm -rf src/engine && mkdir -p src/engine/testkit
-for f in lib solana jupiter live livecycle ai; do cp "$SRC/$f.ts" "src/engine/$f.ts"; done
+for f in lib solana jupiter live livecycle ai scan; do cp "$SRC/$f.ts" "src/engine/$f.ts"; done
 cp "$SRC"/*.test.ts "$SRC"/*.itest.ts src/engine/
 cp "$SRC"/testkit/*.mjs src/engine/testkit/
 # Les tests remplacent le client Supabase par un faux : on accepte aussi le nom Node (sans « npm: »).
