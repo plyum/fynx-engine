@@ -9,7 +9,9 @@ services:
     plan: 0.5c-512mb
     region: oregon
     buildCommand: npm install --omit=dev
-    startCommand: npm start
+    # « exec node » et non « npm start » : npm ne transmet pas SIGTERM à node, donc le verrou du moteur n'était jamais rendu
+    # à chaque mise à jour (surveillance coupée ~2 min). Avec exec, node reçoit lui-même le signal et rend le verrou.
+    startCommand: exec node src/server.ts
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
