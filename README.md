@@ -9,6 +9,8 @@ La base de données, la connexion et les portefeuilles chiffrés restent dans Su
   Ne jamais le modifier ici à la main : on change la source, on relance le script, on relance les tests du projet principal, puis on pousse ici.
 - `src/service.ts` : la boucle. Un tour toutes les 5 s, un tour complet (analyse, valorisation) toutes les 30 s.
 - `src/server.ts` : démarre la boucle, expose `GET /health`, s'arrête proprement sur SIGTERM (rend le verrou).
+  Sur Render, la commande de démarrage est `exec node src/server.ts` et **pas** `npm start` : npm ne transmet pas SIGTERM à node, le verrou
+  n'était alors jamais rendu et la surveillance s'interrompait ~2 min à chaque mise à jour (vérifié, et couvert par un test).
 - **Verrou Postgres** (`acquire_engine_lock`, renouvelé à chaque tour) : un seul moteur tourne à la fois. La fonction Supabase `tick`
   (déclenchée par pg_cron toutes les 30 s) reste en **secours** : si ce serveur tombe, elle reprend au bout de 120 s au plus.
 
@@ -45,7 +47,8 @@ est fixée dans `.node-version` et dans `render.yaml`. Les dépendances sont fig
 ## Tests
 `npm test` lance :
 - `test/service.test.ts` : la boucle avec une horloge simulée (cadence 5 s, tour complet toutes les 30 s, verrou, pannes, arrêt) ;
-- `test/smoke.test.ts` : le vrai point d'entrée `src/server.ts` avec un faux Supabase (démarrage, prise du verrou, `/health`, arrêt propre) ;
+- `test/smoke.test.ts` : le vrai point d'entrée `src/server.ts` avec un faux Supabase (démarrage, prise du verrou, `/health`, arrêt propre,
+  agent IA actif/inactif, et la commande de démarrage de `render.yaml` exécutée telle quelle puis arrêtée par SIGTERM) ;
 - `test/real-client.test.ts` : le même point d'entrée avec le **vrai** `@supabase/supabase-js` (après `npm install`) face à un faux serveur d'API local
   (requêtes HTTP réelles, verrou, tour du moteur, `/health`, arrêt propre). Ignoré si les dépendances ne sont pas installées.
 
