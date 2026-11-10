@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
+import { readFileSync } from 'node:fs';
 
 const free = () => new Promise<number>((res) => { const s = createServer().listen(0, () => { const p = (s.address() as { port: number }).port; s.close(() => res(p)); }); });
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -44,6 +45,33 @@ test('démarrage, verrou pris, santé 200, arrêt propre (SIGTERM) avec verrou r
   assert.equal(await exit, 0);
   assert.match(out, /RPC release_engine_lock/);
   assert.match(out, /verrou rendu/);
+});
+
+// Régression constatée sur Render : avec « npm start », SIGTERM tue npm mais pas node (processus orphelin) → le verrou n'est jamais
+// rendu et la surveillance s'arrête ~2 min à chaque mise à jour. On exécute donc la VRAIE commande de démarrage de render.yaml.
+test('render.yaml : la commande de démarrage transmet SIGTERM à node (verrou rendu, arrêt propre)', async () => {
+  const yml = readFileSync(new URL('../render.yaml', import.meta.url), 'utf8');
+  const m = yml.match(/^\s*startCommand:\s*(.+?)\s*$/m);
+  assert.ok(m, 'startCommand introuvable dans render.yaml');
+  const port = await free();
+  const p = spawn('sh', ['-c', m[1]!], {
+    cwd: new URL('..', import.meta.url).pathname, detached: true,
+    env: { PATH: process.env.PATH, PORT: String(port), SUPABASE_URL: 'http://fake', SUPABASE_SERVICE_ROLE_KEY: 'x'.repeat(40), NODE_OPTIONS: `--import ${hook}` },
+  });
+  let out = '';
+  p.stdout!.on('data', (d) => (out += d));
+  p.stderr!.on('data', (d) => (out += d));
+  const exited = new Promise<void>((r) => p.on('exit', () => r()));
+  try {
+    for (let i = 0; i < 40 && !/verrou obtenu/.test(out); i++) await wait(100);
+    assert.match(out, /verrou obtenu/, `le serveur n'a pas démarré avec « ${m[1]} ». Sortie :\n${out}`);
+    p.kill('SIGTERM'); // comme Render : le signal n'est envoyé qu'au processus de la commande de démarrage
+    await exited;
+    for (let i = 0; i < 40 && !/verrou rendu/.test(out); i++) await wait(100);
+    assert.match(out, /verrou rendu/, `SIGTERM n'a pas atteint node avec « ${m[1]} » (verrou jamais rendu). Sortie :\n${out}`);
+  } finally {
+    try { process.kill(-p.pid!, 'SIGKILL'); } catch { /* déjà terminé */ }
+  }
 });
 
 async function bootAndRead(extra: Record<string, string>): Promise<string> {
