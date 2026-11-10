@@ -45,3 +45,37 @@ test('démarrage, verrou pris, santé 200, arrêt propre (SIGTERM) avec verrou r
   assert.match(out, /RPC release_engine_lock/);
   assert.match(out, /verrou rendu/);
 });
+
+async function bootAndRead(extra: Record<string, string>): Promise<string> {
+  const port = await free();
+  const p = spawn('node', ['--import', hook, entry], {
+    env: { PATH: process.env.PATH, PORT: String(port), SUPABASE_URL: 'http://fake', SUPABASE_SERVICE_ROLE_KEY: 'x'.repeat(40), ...extra },
+  });
+  let out = '';
+  p.stdout.on('data', (d) => (out += d));
+  p.stderr.on('data', (d) => (out += d));
+  const exit = new Promise<number | null>((r) => p.on('exit', r));
+  for (let i = 0; i < 40 && !/serveur de santé/.test(out); i++) await wait(100);
+  p.kill('SIGTERM');
+  assert.equal(await exit, 0, out);
+  return out;
+}
+
+test('agent IA : sans clé Anthropic → inactif, journalisé, le moteur démarre normalement', async () => {
+  const out = await bootAndRead({});
+  assert.match(out, /Agent IA inactif \(ANTHROPIC_API_KEY absent\)/);
+});
+
+test('agent IA : avec clé → actif (modèle, veto, budget par défaut) ; la clé n’apparaît jamais dans les journaux', async () => {
+  const KEY = 'sk-ant-api03-SECRETSECRETSECRET';
+  const out = await bootAndRead({ ANTHROPIC_API_KEY: KEY });
+  assert.match(out, /Agent IA actif : claude-haiku-5-5, veto actif \(confiance ≥ 60 %\), budget 8 \$\/mois\./);
+  assert.doesNotMatch(out, /SECRETSECRET/);
+});
+
+test('agent IA : réglages par variables (veto coupé, budget, seuil) pris en compte', async () => {
+  const out = await bootAndRead({ ANTHROPIC_API_KEY: 'sk-ant-x', AI_VETO: 'off', AI_MONTHLY_BUDGET_USD: '4', AI_MODEL: 'claude-haiku-5-5' });
+  assert.match(out, /Agent IA actif : claude-haiku-5-5, veto coupé \(avis seulement\), budget 4 \$\/mois\./);
+  const out2 = await bootAndRead({ ANTHROPIC_API_KEY: 'sk-ant-x', AI_MIN_CONFIDENCE: '80' });
+  assert.match(out2, /veto actif \(confiance ≥ 80 %\)/);
+});
