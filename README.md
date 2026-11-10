@@ -23,7 +23,20 @@ La base de données, la connexion et les portefeuilles chiffrés restent dans Su
 | `WALLET_ENCRYPTION_KEY` | pour le compte réel | **la même valeur** que dans les secrets des fonctions Supabase |
 | `SOLANA_RPC_URL` | non | RPC Solana dédié (recommandé) ; par défaut le RPC public |
 | `JUPITER_API_KEY` | non | clé Jupiter gratuite |
+| `ANTHROPIC_API_KEY` | non | active l'agent « Analyste IA » (Claude Haiku). Sans elle, les règles décident seules |
+| `AI_VETO` | non | `off` = l'IA donne son avis mais ne bloque plus rien (par défaut : veto actif) |
+| `AI_MIN_CONFIDENCE` | non | confiance minimale (0-100) d'un « avoid » pour bloquer un achat (60 par défaut) |
+| `AI_MONTHLY_BUDGET_USD` | non | plafond de dépense IA par mois civil UTC (8 par défaut) ; atteint = plus d'appels, les règles continuent |
+| `AI_MODEL` | non | modèle utilisé (`claude-haiku-5-5` par défaut) |
 | `PORT` | non | fourni par Render |
+
+## Agent IA (« Analyste IA »)
+Pour chaque jeton que les règles ont **déjà accepté**, juste avant l'achat, un appel à Claude Haiku relit les données de marché et le rapport de risque
+et répond `avoid`, `ok` ou `unsure` avec une confiance et des raisons en français.
+- **Il ne peut que bloquer** : un `avoid` assez sûr (≥ 60 % par défaut) annule l'achat (événement « VETO IA … »). Il ne déclenche jamais d'achat, ne change ni la taille ni les plafonds, et n'intervient pas sur les sorties (stop loss, take profit).
+- **Panne = pas d'avis** : clé absente, réseau, quota, réponse illisible, budget du mois atteint, coupe-circuit après 3 échecs, ou plus de 12 s d'attente cumulée dans un tour (un modèle lent ne retarde jamais les stops) → les règles décident seules (avertissement affiché, jamais de blocage général).
+- **Données non fiables** : noms et textes de jetons sont nettoyés, bornés et déclarés « non fiables » dans l'invite ; la réponse est forcée en JSON strict à trois valeurs.
+- **Cache et coût** : un avis par jeton pour 15 min (partagé entre comptes), historique dans la table `ai_verdicts` (jetons, coût, entrée) pour évaluer l'agent après coup ; le budget du mois est la somme de cette table (fonction SQL `ai_month_spend`). Environ 0,0001 $ par avis.
 
 ## Node
 Le serveur exécute les fichiers `.ts` directement, sans compilation : Node ≥ 22.18. La version exacte (22.23.4, celle des tests)
