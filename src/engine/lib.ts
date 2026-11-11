@@ -157,8 +157,12 @@ export function simulateFill(side: 'BUY' | 'SELL', price: number, usd: number, l
 }
 
 export type OpenPos = { entry_price: number; stop_price: number | null; take_profit_price: number | null; trailing_pct: number | null; peak_price: number | null };
+/** Hausse maximale du pic par tick : un prix isolé bien au-dessus du dernier sommet connu est un prix aberrant (mauvais pool, tick erroné),
+ *  pas un vrai sommet. Un vrai pump reste suivi : le pic monte de +15 % à chaque tick (toutes les ~5 s). */
+export const MAX_PEAK_JUMP = 1.15;
 export function evaluateExit(pos: OpenPos, price: number, priceAgeMs: number): { action: 'hold' | 'sell' | 'stale'; reason?: string; peak: number } {
-  const peak = Math.max(pos.peak_price ?? pos.entry_price, price);
+  const prevPeak = pos.peak_price ?? pos.entry_price;
+  const peak = Math.max(prevPeak, Math.min(price, prevPeak * MAX_PEAK_JUMP));
   if (priceAgeMs > 5 * 60_000) return { action: 'stale', peak: pos.peak_price ?? pos.entry_price };
   if (pos.stop_price !== null && price <= pos.stop_price) return { action: 'sell', reason: 'Stop Loss atteint', peak };
   if (pos.trailing_pct !== null && price <= peak * (1 - pos.trailing_pct / 100) && peak > pos.entry_price) return { action: 'sell', reason: 'Trailing Stop atteint', peak };
