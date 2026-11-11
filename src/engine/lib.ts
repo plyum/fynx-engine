@@ -213,9 +213,23 @@ export const EXCLUDED_MINTS = new Set([
   'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
 ]);
 
-// Pour chaque token (en tant que token de base), garde la paire la plus liquide ayant un prix valide.
-export function pickBestPairs(arr: unknown): Map<string, Pair> {
-  const out = new Map<string, Pair>();
+// ───────────────────────── Prix fiables (anti-prix aberrants) ─────────────────────────
+// DexScreener renvoie toutes les paires d'un token. Une paire secondaire (liquidité gonflée, prix faux) apparaît parfois
+// pendant un seul tour : vu le 11/11 sur BULLHARIS, ×5 puis ×2,5 pendant 5 s, ce qui a faussé l'équité et le trailing stop.
+
+/** Garde la paire déjà suivie tant qu'elle figure dans la réponse ; sinon la plus liquide. */
+export function choosePair(all: Pair[], prevPair: string | undefined): Pair | null {
+  let best: Pair | null = null;
+  for (const p of all) {
+    if (prevPair && p.pairAddress === prevPair) return p;
+    if (!best || (p.liquidity?.usd ?? 0) > (best.liquidity?.usd ?? 0)) best = p;
+  }
+  return best;
+}
+
+/** Toutes les paires valides par token (token de base, Solana, prix > 0). */
+export function groupPairs(arr: unknown): Map<string, Pair[]> {
+  const out = new Map<string, Pair[]>();
   if (!Array.isArray(arr)) return out;
   for (const raw of arr) {
     const p = raw as Pair;
@@ -223,9 +237,50 @@ export function pickBestPairs(arr: unknown): Map<string, Pair> {
     if (!m || (p.chainId && p.chainId !== 'solana')) continue;
     const price = Number(p.priceUsd);
     if (!Number.isFinite(price) || price <= 0) continue;
-    const prev = out.get(m);
-    if (!prev || (p.liquidity?.usd ?? 0) > (prev.liquidity?.usd ?? 0)) out.set(m, p);
+    const l = out.get(m);
+    if (l) l.push(p); else out.set(m, [p]);
   }
+  return out;
+}
+
+export type PxMem = { px: number; at: number; pend?: number };
+/** Écart (en multiple) au-delà duquel un prix doit être confirmé au tour suivant avant d'être utilisé. */
+export const SPIKE_X = 1.5;
+/** Au-delà de cette ancienneté, le dernier prix validé n'est plus une référence : le nouveau prix est accepté tel quel. */
+export const PX_MEM_TTL_MS = 120_000;
+/**
+ * Filtre anti-pic : un prix qui saute de plus de ×1,5 (ou chute sous ÷1,5) d'un tour à l'autre est retenu une fois ;
+ * il n'est accepté que s'il se confirme au tour suivant (à ±15 % près). Sinon le dernier prix validé est conservé.
+ * Vaut dans les deux sens : un faux plongeon ne déclenche pas non plus de stop loss.
+ */
+export function guardPrice(mem: PxMem | undefined, raw: number, now: number): { px: number; mem: PxMem; held: boolean } {
+  if (!mem || !(mem.px > 0) || now - mem.at > PX_MEM_TTL_MS) return { px: raw, mem: { px: raw, at: now }, held: false };
+  const r = raw / mem.px;
+  if (r <= SPIKE_X && r >= 1 / SPIKE_X) return { px: raw, mem: { px: raw, at: now }, held: false };
+  if (mem.pend && Math.abs(raw / mem.pend - 1) <= 0.15) return { px: raw, mem: { px: raw, at: now }, held: false };
+  return { px: mem.px, mem: { px: mem.px, at: mem.at, pend: raw }, held: true };
+}
+
+/** Mémoire anti-prix aberrants (paire suivie + dernier prix validé par token). Vit le temps du processus du moteur. */
+export type PairMemory = { pair: Map<string, string>; px: Map<string, PxMem> };
+export const pairMemory: PairMemory = { pair: new Map(), px: new Map() };
+
+/**
+ * Pour chaque token (en tant que token de base), la paire à utiliser : la paire déjà suivie si elle est encore là, sinon la plus
+ * liquide ; son prix passe par le filtre anti-pic. `mem = null` : choix pur (la plus liquide, aucun filtre).
+ */
+export function pickBestPairs(arr: unknown, mem: PairMemory | null = pairMemory, now = Date.now()): Map<string, Pair> {
+  const out = new Map<string, Pair>();
+  for (const [m, l] of groupPairs(arr)) {
+    const p = choosePair(l, mem?.pair.get(m));
+    if (!p) continue;
+    if (!mem) { out.set(m, p); continue; }
+    if (p.pairAddress) mem.pair.set(m, p.pairAddress);
+    const g = guardPrice(mem.px.get(m), Number(p.priceUsd), now);
+    mem.px.set(m, g.mem);
+    out.set(m, g.held ? { ...p, priceUsd: String(g.px) } : p);
+  }
+  if (mem && mem.px.size > 3000) for (const [m, v] of mem.px) if (now - v.at > 30 * 60_000) { mem.px.delete(m); mem.pair.delete(m); }
   return out;
 }
 
