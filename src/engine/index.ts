@@ -599,11 +599,11 @@ export async function runTick(ctx: Ctx, opts: { full?: boolean } = {}) {
     }
   }
 
-  // 5 bis) Contrôleur de vente : avis en arrière-plan sur les positions PAPIER ouvertes (jamais le compte réel) ; le tour n'attend pas.
+  // 5 bis) Contrôleur de vente : avis en arrière-plan sur les positions ouvertes (papier et réel) ; le tour n'attend pas.
   if (ctx.team) {
     const byMint = new Map<string, { list: Pos[]; set: Settings }>();
     for (const p of plans) {
-      if (p.a.mode !== 'paper' || (p.next !== 'running' && p.next !== 'paused') || !aiOn(p.a, AGENT_SELLER)) continue;
+      if ((p.next !== 'running' && p.next !== 'paused') || !aiOn(p.a, AGENT_SELLER)) continue;
       for (const pos of open.get(p.a.id) ?? []) {
         if (pos.status !== 'open') continue;
         const e = byMint.get(pos.mint) ?? { list: [], set: p.a.set };
@@ -723,11 +723,15 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
       else if (ex.action === 'stale') stale++;
       else {
         if (ex.peak > (pos.peak_price ?? pos.entry_price)) await sb.from('positions').update({ peak_price: ex.peak }).eq('id', pos.id);
-        // Contrôleur de vente IA : comptes PAPIER uniquement, avis récent et prix proche de celui de l'avis. Les stops restent prioritaires.
-        const sig = ctx.team && a.mode === 'paper' && hasPrice && aiOn(a, AGENT_SELLER) ? ctx.team.sellSignal(pos.mint, price) : null;
+        // Contrôleur de vente IA (papier et réel) : avis récent et prix proche de celui de l'avis. Les stops restent prioritaires (filet de sécurité).
+        const sig = ctx.team && hasPrice && aiOn(a, AGENT_SELLER) ? ctx.team.sellSignal(pos.mint, price) : null;
         if (sig?.act) {
           const why = `Contrôleur de vente IA : ${(sig.reasons || sig.red_flags.join(' ; ') || 'retournement repéré').slice(0, 160)} (confiance ${sig.confidence} %)`;
-          if (await sell(ctx, a, pos, pair!, why)) { orders++; ag(ctx, a.id, { agent: AGENT_SELLER, status: 'RUNNING' }); }
+          // Compte réel : sans session (clé, soldes), rien n'est vendu à l'aveugle ; le stop loss de sécurité reste actif.
+          const S = a.mode === 'live' ? await ensureLive() : null;
+          if (a.mode === 'live' && !S) continue;
+          const done = S ? await liveSell(ctx, a, pos, pair!, why, S) : await sell(ctx, a, pos, pair!, why);
+          if (done) { orders++; ag(ctx, a.id, { agent: AGENT_SELLER, status: 'RUNNING' }); }
         }
       }
     }
@@ -941,15 +945,15 @@ async function processAccount(ctx: Ctx, p: Plan, openStart: Pos[], pairs: Map<st
     else if (scanned && sh.deepFailures > 0) ag(ctx, a.id, { agent: 'RUGCHECK', status: 'WARNING', err: `${sh.deepFailures} analyse(s) sans réponse RugCheck (token ignoré).` });
     // Équipe IA : partagée entre les comptes, chaque compte affiche ses compteurs (appels facturés, dernière erreur).
     for (const agent of TEAM_AGENTS) {
-      const on = aiOn(a, agent) && (agent === AGENT_CONTRACT ? !!ctx.ai : !!ctx.team) && (agent !== AGENT_SELLER || a.mode === 'paper');
+      const on = aiOn(a, agent) && (agent === AGENT_CONTRACT ? !!ctx.ai : !!ctx.team);
       const st = sh.teamStats?.[agent];
       ag(ctx, a.id, { agent, status: !on ? 'IDLE' : st?.err ? 'WARNING' : 'RUNNING', n: on ? st?.ops ?? 0 : 0, err: on && st ? st.err : on ? undefined : null });
     }
   } else if (status === 'paused' || status === 'closing') {
     for (const k of ['SCANNER', 'RUGCHECK', 'ANALYST', 'SIZER', ...TEAM_AGENTS]) ag(ctx, a.id, { agent: k, status: 'IDLE', err: null });
     ag(ctx, a.id, { agent: 'EXECUTOR', status: 'RUNNING', err: null });
-    // Pause : plus d'entrées, mais les sorties continuent, y compris l'avis du contrôleur de vente (papier).
-    if (status === 'paused' && ctx.team && a.mode === 'paper' && aiOn(a, AGENT_SELLER)) ag(ctx, a.id, { agent: AGENT_SELLER, status: 'RUNNING', n: sh.teamStats?.[AGENT_SELLER]?.ops ?? 0 });
+    // Pause : plus d'entrées, mais les sorties continuent, y compris l'avis du contrôleur de vente.
+    if (status === 'paused' && ctx.team && aiOn(a, AGENT_SELLER)) ag(ctx, a.id, { agent: AGENT_SELLER, status: 'RUNNING', n: sh.teamStats?.[AGENT_SELLER]?.ops ?? 0 });
   } else if (p.prev !== 'stopped') {
     for (const k of ['SCANNER', 'RUGCHECK', 'ANALYST', 'SIZER', 'EXECUTOR', ...TEAM_AGENTS]) ag(ctx, a.id, { agent: k, status: 'IDLE', err: null });
   }
