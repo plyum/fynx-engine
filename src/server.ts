@@ -98,8 +98,13 @@ const server = createServer((req, res) => {
 });
 server.listen(Number(process.env['PORT'] ?? 10000), '0.0.0.0', () => log(`serveur de santé sur le port ${(server.address() as { port: number }).port}`));
 
+// Un tour rapide (prix des positions, stop loss / take profit) toutes les 2 s pour le scalping ; réglable par TICK_GAP_MS (1 à 10 s).
+const gapEnv = Number(process.env['TICK_GAP_MS']);
+const gapMs = Number.isFinite(gapEnv) && gapEnv >= 1_000 && gapEnv <= 10_000 ? gapEnv : 2_000;
+log(`tour rapide toutes les ${gapMs / 1000} s`);
+
 const done = runService<Ctx>({
-  now: Date.now, sleep, makeCtx, tick: (ctx, opts) => runTick(ctx, opts), flush, lock, state, shouldStop: () => stop.signal.aborted, log,
+  now: Date.now, sleep, makeCtx, tick: (ctx, opts) => runTick(ctx, opts), flush, lock, state, shouldStop: () => stop.signal.aborted, log, gapMs,
 });
 
 let stopping = false;
