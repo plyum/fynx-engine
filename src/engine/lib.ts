@@ -170,20 +170,26 @@ export const MAX_PEAK_JUMP = 1.15;
 export const EXIT = {
   /** Perte maximale tolérée depuis le prix d'achat (glissement d'entrée compris) : au-delà, vente immédiate. */
   lossCutPct: 2.5,
-  /** Le verrou de gain s'arme quand le sommet atteint ce gain (couvre les frais d'un aller-retour). */
-  armPct: 1.8,
-  /** Gain plancher une fois armé : on ne rend jamais plus que ça. */
-  floorPct: 1.0,
+  /** Coût estimé de la sortie, en % du prix d'achat : frais papier 0,5 % à l'achat + 0,5 % à la vente + glissement de vente ≥ 0,3 %
+   *  (en réel : glissement Jupiter + frais réseau, du même ordre). Un « gain » brut plus petit que ça est une perte une fois vendu. */
+  costPct: 1.3,
+  /** Le verrou de gain s'arme quand le gain NET (brut − coût) au sommet atteint ce niveau. */
+  armNetPct: 1.2,
+  /** Gain NET plancher une fois armé : une prise de profit ne doit jamais finir en perte. */
+  floorNetPct: 0.5,
   /** Un token qui n'a jamais armé le verrou après ce délai est vendu : la place sert à un token qui monte. */
   noMomentumMin: 6,
 };
-/** Part du gain au sommet que le verrou garde : plus le gain est gros, plus on serre (on ne rend pas un gros pump). */
-export function keepShare(peakGainPct: number): number {
-  return peakGainPct >= 30 ? 0.85 : peakGainPct >= 10 ? 0.8 : 0.7;
+/** Part du gain net au sommet que le verrou garde : plus le gain est gros, plus on serre (on ne rend pas un gros pump). */
+export function keepShare(peakNetPct: number): number {
+  return peakNetPct >= 30 ? 0.85 : peakNetPct >= 10 ? 0.8 : 0.7;
 }
-/** Seuil de vente du verrou (en % de gain) pour un sommet donné, ou null s'il n'est pas armé. */
+/** Seuil de vente du verrou, en % de gain BRUT (celui que l'on compare au prix), pour un sommet brut donné ; null s'il n'est pas armé.
+ *  Le calcul se fait sur le gain net : on garde une part du gain net du sommet, jamais moins que le plancher net, puis on rajoute le coût. */
 export function lockLevel(peakGainPct: number): number | null {
-  return peakGainPct >= EXIT.armPct ? Math.max(EXIT.floorPct, peakGainPct * keepShare(peakGainPct)) : null;
+  const net = peakGainPct - EXIT.costPct;
+  if (net < EXIT.armNetPct) return null;
+  return EXIT.costPct + Math.max(EXIT.floorNetPct, net * keepShare(net));
 }
 /** Mémoire du processus : quand le moteur a vu chaque position pour la première fois (pour la règle « pas d'élan »). */
 const firstSeen = new Map<string, number>();
