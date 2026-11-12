@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { hostname } from 'node:os';
 import { createClient } from '@supabase/supabase-js';
 import { flush, runTick, type Ctx } from './engine/index.ts';
+import { runScalp } from './engine/scalp.ts';
 import { makeRpc } from './engine/solana.ts';
 import { makeJupiter } from './engine/jupiter.ts';
 import { fetchUsdPrice } from './engine/live.ts';
@@ -103,8 +104,15 @@ const gapEnv = Number(process.env['TICK_GAP_MS']);
 const gapMs = Number.isFinite(gapEnv) && gapEnv >= 1_000 && gapEnv <= 10_000 ? gapEnv : 2_000;
 log(`tour rapide toutes les ${gapMs / 1000} s`);
 
+// Un tour = le bot normal, puis le mode Scalping (même verrou, même session de portefeuille, mêmes événements). Une erreur du
+// scalping ne casse jamais le tour normal.
+async function tickAll(ctx: Ctx, opts: { full: boolean }) {
+  const r = await runTick(ctx, opts);
+  try { await runScalp(ctx); } catch (e) { log(`scalping : ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+  return r;
+}
 const done = runService<Ctx>({
-  now: Date.now, sleep, makeCtx, tick: (ctx, opts) => runTick(ctx, opts), flush, lock, state, shouldStop: () => stop.signal.aborted, log, gapMs,
+  now: Date.now, sleep, makeCtx, tick: (ctx, opts) => tickAll(ctx, opts), flush, lock, state, shouldStop: () => stop.signal.aborted, log, gapMs,
 });
 
 let stopping = false;
