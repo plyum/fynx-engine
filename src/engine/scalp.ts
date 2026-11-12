@@ -3,7 +3,7 @@
 // Ce module ne fait que les ENTRÉES : chaque position scalping porte son TP / SL en %, et le moteur normal la vend
 // (stop loss / take profit vérifiés à chaque tour rapide, soit toutes les 2 s).
 // Sources : tendances GeckoTerminal (pools Solana en tendance) + chiffres DexScreener ; risque : RugCheck (même score que le bot normal).
-import { pickBestPairs, riskFromRow, scoreRisk, simulateFill, toStoredFindings, type Pair, type RiskResult } from './lib.ts';
+import { pickBestPairs, recentlyFailed, riskFromRow, scoreRisk, simulateFill, toStoredFindings, type Pair, type RiskResult } from './lib.ts';
 import { buyToken, refreshBalances } from './live.ts';
 import { entryGate, liveGate, openSession, secretUsable, type LiveInfo, type Session } from './livecycle.ts';
 import type { Ctx } from './index.ts';
@@ -175,7 +175,7 @@ async function scalpAccount(ctx: Ctx, a: ScalpAcct, budget: { n: number; fresh: 
   const busy = new Set([...open.map((p) => p.mint), ...(recent ?? []).map((p) => p.mint)]);
 
   for (const c of ranked) {
-    if (busy.has(c.mint)) continue;
+    if (busy.has(c.mint) || recentlyFailed(c.mint)) continue; // pas de rachat d'un token qui n'a pas payé (6 h)
     if (!scalpPick(c.pair, a.cfg, Date.now()).ok) continue;
     const risk = await riskOf(ctx, c.mint, c.pair, budget);
     if (!risk || risk.has_critical || risk.score > a.cfg.maxRisk) continue;

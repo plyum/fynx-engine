@@ -156,17 +156,74 @@ export function simulateFill(side: 'BUY' | 'SELL', price: number, usd: number, l
   return { fillPrice: fill, slippagePct: slip, feeUsd: fee };
 }
 
-export type OpenPos = { entry_price: number; stop_price: number | null; take_profit_price: number | null; trailing_pct: number | null; peak_price: number | null };
+export type OpenPos = {
+  entry_price: number; stop_price: number | null; take_profit_price: number | null; trailing_pct: number | null; peak_price: number | null;
+  id?: string; mint?: string;
+};
 /** Hausse maximale du pic par tick : un prix isolé bien au-dessus du dernier sommet connu est un prix aberrant (mauvais pool, tick erroné),
- *  pas un vrai sommet. Un vrai pump reste suivi : le pic monte de +15 % à chaque tick (toutes les ~5 s). */
+ *  pas un vrai sommet. Un vrai pump reste suivi : le pic monte de +15 % à chaque tour (toutes les 1 à 2 s). */
 export const MAX_PEAK_JUMP = 1.15;
-export function evaluateExit(pos: OpenPos, price: number, priceAgeMs: number): { action: 'hold' | 'sell' | 'stale'; reason?: string; peak: number } {
+
+// ───────────────────────── Conscience de sortie ─────────────────────────
+// Le bot ne se contente plus du TP / SL : il laisse courir tant que ça monte, encaisse dès que le gain recule, coupe vite une
+// perte et libère la place quand un token ne bouge pas. Toutes les positions (papier, réel, scalping), à chaque tour rapide.
+export const EXIT = {
+  /** Perte maximale tolérée depuis le prix d'achat (glissement d'entrée compris) : au-delà, vente immédiate. */
+  lossCutPct: 2.5,
+  /** Le verrou de gain s'arme quand le sommet atteint ce gain (couvre les frais d'un aller-retour). */
+  armPct: 1.8,
+  /** Gain plancher une fois armé : on ne rend jamais plus que ça. */
+  floorPct: 1.0,
+  /** Un token qui n'a jamais armé le verrou après ce délai est vendu : la place sert à un token qui monte. */
+  noMomentumMin: 6,
+};
+/** Part du gain au sommet que le verrou garde : plus le gain est gros, plus on serre (on ne rend pas un gros pump). */
+export function keepShare(peakGainPct: number): number {
+  return peakGainPct >= 30 ? 0.85 : peakGainPct >= 10 ? 0.8 : 0.7;
+}
+/** Seuil de vente du verrou (en % de gain) pour un sommet donné, ou null s'il n'est pas armé. */
+export function lockLevel(peakGainPct: number): number | null {
+  return peakGainPct >= EXIT.armPct ? Math.max(EXIT.floorPct, peakGainPct * keepShare(peakGainPct)) : null;
+}
+/** Mémoire du processus : quand le moteur a vu chaque position pour la première fois (pour la règle « pas d'élan »). */
+const firstSeen = new Map<string, number>();
+/** Mémoire des dernières sorties par token (gain au moment de la décision) : pas de rachat d'un token qui n'a pas payé. */
+export const exitMemory = new Map<string, { at: number; gainPct: number }>();
+export const REBUY_BLOCK_MS = 6 * 60 * 60_000;
+export const REBUY_MIN_GAIN_PCT = 3;
+/** Un token récemment vendu sans vrai gain ne doit pas être racheté (6 h). */
+export function recentlyFailed(mint: string | undefined, nowMs = Date.now()): boolean {
+  const m = mint ? exitMemory.get(mint) : undefined;
+  return !!m && nowMs - m.at < REBUY_BLOCK_MS && m.gainPct < REBUY_MIN_GAIN_PCT;
+}
+/** Tests uniquement. */
+export function _resetExitMemory() { firstSeen.clear(); exitMemory.clear(); }
+
+const pct = (v: number) => `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(1)} %`;
+
+export function evaluateExit(pos: OpenPos, price: number, priceAgeMs: number, nowMs = Date.now()): { action: 'hold' | 'sell' | 'stale'; reason?: string; peak: number } {
   const prevPeak = pos.peak_price ?? pos.entry_price;
   const peak = Math.max(prevPeak, Math.min(price, prevPeak * MAX_PEAK_JUMP));
   if (priceAgeMs > 5 * 60_000) return { action: 'stale', peak: pos.peak_price ?? pos.entry_price };
-  if (pos.stop_price !== null && price <= pos.stop_price) return { action: 'sell', reason: 'Stop Loss atteint', peak };
-  if (pos.trailing_pct !== null && price <= peak * (1 - pos.trailing_pct / 100) && peak > pos.entry_price) return { action: 'sell', reason: 'Trailing Stop atteint', peak };
-  if (pos.take_profit_price !== null && price >= pos.take_profit_price) return { action: 'sell', reason: 'Take Profit atteint', peak };
+  if (pos.id && !firstSeen.has(pos.id)) firstSeen.set(pos.id, nowMs);
+  const sell = (reason: string) => {
+    if (pos.mint && pos.entry_price > 0) exitMemory.set(pos.mint, { at: nowMs, gainPct: (price / pos.entry_price - 1) * 100 });
+    if (pos.id) firstSeen.delete(pos.id);
+    return { action: 'sell' as const, reason, peak };
+  };
+  if (pos.stop_price !== null && price <= pos.stop_price) return sell('Stop Loss atteint');
+  if (pos.take_profit_price !== null && price >= pos.take_profit_price) return sell('Take Profit atteint');
+  if (!(pos.entry_price > 0)) return { action: 'hold', peak };
+  const gain = (price / pos.entry_price - 1) * 100;
+  const peakGain = (peak / pos.entry_price - 1) * 100;
+  if (gain <= -EXIT.lossCutPct) return sell(`Perte coupée tout de suite (${pct(gain)})`);
+  const lock = lockLevel(peakGain);
+  if (lock !== null && gain <= lock) return sell(`Prise de profit : ${pct(gain)} (sommet ${pct(peakGain)}), le gain recule`);
+  if (pos.trailing_pct !== null && price <= peak * (1 - pos.trailing_pct / 100) && peak > pos.entry_price) return sell('Trailing Stop atteint');
+  const seen = pos.id ? firstSeen.get(pos.id) : undefined;
+  if (lock === null && seen !== undefined && nowMs - seen >= EXIT.noMomentumMin * 60_000) {
+    return sell(`Pas d’élan en ${EXIT.noMomentumMin} min (${pct(gain)}) : place à un token qui monte`);
+  }
   return { action: 'hold', peak };
 }
 
@@ -193,8 +250,12 @@ export function evaluateEntry(pair: DexPair, risk: RiskResult, s: EntrySettings,
   const pc = pair.priceChange;
   if ((pc?.h1 ?? 0) <= 0) why.push('Tendance 1 h non haussière');
   if ((pc?.h1 ?? 0) > 150) why.push('Hausse 1 h trop forte (risque de poursuite du pump)');
-  if ((pc?.m5 ?? 0) < -5) why.push('Baisse récente sur 5 min');
-  return why.length ? { ok: false, reasons: why } : { ok: true, reasons: [`Score ${risk.score} (${risk.level}), liquidité ${Math.round(liq)} $, tendance 1 h +${pc?.h1}%, acheteurs > vendeurs`] };
+  if ((pc?.m5 ?? 0) <= 0) why.push('Ne monte pas en ce moment (5 min)');
+  const m5 = pair.txns?.m5;
+  if (!m5 || m5.buys <= m5.sells) why.push('Pas plus d’acheteurs que de vendeurs sur 5 min');
+  if ((pair.volume?.m5 ?? 0) < 1_000) why.push('Volume 5 min trop faible : le prix ne bouge pas');
+  if (recentlyFailed((pair as { baseToken?: { address?: string } }).baseToken?.address)) why.push('Déjà vendu il y a peu sans vrai gain : on passe à un token qui monte');
+  return why.length ? { ok: false, reasons: why } : { ok: true, reasons: [`Score ${risk.score} (${risk.level}), liquidité ${Math.round(liq)} $, en hausse (+${pc?.m5} % sur 5 min, +${pc?.h1} % sur 1 h), acheteurs > vendeurs`] };
 }
 
 // ───────────────────────── Données de marché ─────────────────────────
@@ -304,15 +365,17 @@ export function extractMints(src: { boosts: unknown; profiles: unknown; rcNew: u
 const NEUTRAL_RISK: RiskResult = { score: 0, level: 'low', has_critical: false, findings: [], unknown: [] };
 
 // Pré-filtre sans risque (gratuit) : ne garde que les tokens qui pourraient passer les critères de marché.
+/** Candidats à l'achat : filtrés par les règles de marché, puis classés par élan (ce qui monte vite en ce moment). */
 export function rankCandidates(pairs: Map<string, Pair>, mints: string[]): { mint: string; pair: Pair; rank: number }[] {
   const out: { mint: string; pair: Pair; rank: number }[] = [];
   for (const mint of mints) {
     const pair = pairs.get(mint);
     if (!pair) continue;
     if (!evaluateEntry(pair, NEUTRAL_RISK, { max_risk_score: 100, caution_level: 'low' }, 0).ok) continue;
-    out.push({ mint, pair, rank: (pair.liquidity?.usd ?? 0) * (pair.volume?.h1 ?? 0) });
+    // Les tokens qui bougent le plus MAINTENANT d'abord : volume des 5 dernières minutes × hausse sur 5 min ; liquidité pour départager.
+    out.push({ mint, pair, rank: (pair.volume?.m5 ?? 0) * (1 + Math.max(0, pair.priceChange?.m5 ?? 0) / 10) });
   }
-  return out.sort((a, b) => b.rank - a.rank);
+  return out.sort((a, b) => b.rank - a.rank || (b.pair.liquidity?.usd ?? 0) - (a.pair.liquidity?.usd ?? 0));
 }
 
 // Les catégories non vérifiables sont stockées avec le rapport, marquées UNKNOWN (jamais « sûr »).
