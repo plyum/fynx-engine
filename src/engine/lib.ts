@@ -177,6 +177,10 @@ export const EXIT = {
   armNetPct: 1.2,
   /** Gain NET plancher une fois armé : une prise de profit ne doit jamais finir en perte. */
   floorNetPct: 0.5,
+  /** Protection du prix de revient : dès que le sommet a dépassé +0,5 % net (≈ +1,8 % brut), on ne laisse plus la position
+   *  repasser en perte ; vente si le gain retombe à +0,1 % net (≈ +1,4 % brut). Vu le 12-13/11 : des sommets à +2 % revendus à −2,6 %. */
+  breakevenArmNetPct: 0.5,
+  breakevenExitNetPct: 0.1,
   /** Un token qui n'a jamais armé le verrou après ce délai est vendu : la place sert à un token qui monte. */
   noMomentumMin: 6,
 };
@@ -225,6 +229,9 @@ export function evaluateExit(pos: OpenPos, price: number, priceAgeMs: number, no
   if (gain <= -EXIT.lossCutPct) return sell(`Perte coupée tout de suite (${pct(gain)})`);
   const lock = lockLevel(peakGain);
   if (lock !== null && gain <= lock) return sell(`Prise de profit : ${pct(gain)} (sommet ${pct(peakGain)}), le gain recule`);
+  if (lock === null && peakGain - EXIT.costPct >= EXIT.breakevenArmNetPct && gain - EXIT.costPct <= EXIT.breakevenExitNetPct) {
+    return sell(`Protection : retour vers le prix de revient (${pct(gain)}, sommet ${pct(peakGain)}), on sort avant la perte`);
+  }
   if (pos.trailing_pct !== null && price <= peak * (1 - pos.trailing_pct / 100) && peak > pos.entry_price) return sell('Trailing Stop atteint');
   const seen = pos.id ? firstSeen.get(pos.id) : undefined;
   if (lock === null && seen !== undefined && nowMs - seen >= EXIT.noMomentumMin * 60_000) {
