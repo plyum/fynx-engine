@@ -143,7 +143,7 @@ test('conscience : verrou de gain — l’exemple +0,64 $ → +0,44 $ vend', () 
   // Régression du 12/11 : « Prise de profit : +0.8 % » finissait à −0,48 % après frais. Un sommet à +2 % ne déclenche plus rien,
   // et le seuil de vente reste toujours au-dessus du coût de sortie, quel que soit le sommet.
   _resetExitMemory();
-  assert.equal(evaluateExit({ ...pos, peak_price: 1.02 }, 1.008, 1000).action, 'hold');
+  assert.equal(evaluateExit({ ...pos, peak_price: 1.017 }, 1.008, 1000).action, 'hold'); // sommet +1,7 % : rien d'armé
   for (let peak = 0; peak <= 200; peak += 0.1) {
     const l = lockLevel(peak);
     if (l !== null) assert.ok(l >= EXIT.costPct + EXIT.floorNetPct - 1e-9 && l < peak, `sommet ${peak} → seuil ${l}`);
@@ -173,6 +173,24 @@ test('conscience : perte coupée dès −2,5 %, pas d’élan après 6 min, mém
   // gros gain vendu au verrou : rachat autorisé (le token a payé)
   assert.equal(evaluateExit({ ...up, peak_price: 1.2 }, 1.1, 1000, 0).action, 'sell');
   assert.equal(recentlyFailed('MintC', 1000), false);
+});
+
+test('conscience : protection du prix de revient (sommet ≥ +1,8 % brut → sortie vers +1,4 % au lieu de laisser filer en perte)', () => {
+  _resetExitMemory();
+  // cas réel du 12/11 : sommet +2,05 %, revendu à −2,57 % par « pas d'élan » ; il doit sortir dès le retour vers +1,4 %
+  const pos = { id: 'b1', mint: 'MintBE', entry_price: 1, stop_price: 0.7, take_profit_price: null, trailing_pct: null, peak_price: 1.0205 };
+  assert.equal(evaluateExit(pos, 1.019, 1000, 0).action, 'hold');   // +1,9 % : on laisse courir
+  assert.equal(evaluateExit(pos, 1.015, 1000, 0).action, 'hold');   // +1,5 % : encore au-dessus du prix de revient + 0,1 % net
+  const be = evaluateExit(pos, 1.0138, 1000, 0);
+  assert.equal(be.action, 'sell');
+  assert.match(be.reason!, /^Protection : retour vers le prix de revient \(\+1\.4 %, sommet \+2\.\d %\)/);
+  // sommet trop petit (+1,7 %) : la protection ne s'arme pas (le bruit ne déclenche rien)
+  assert.equal(evaluateExit({ ...pos, id: 'b2', peak_price: 1.017 }, 1.012, 1000, 0).action, 'hold');
+  // une fois le verrou de gain armé, c'est lui qui décide (pas la protection)
+  const big = evaluateExit({ ...pos, id: 'b3', peak_price: 1.05 }, 1.03, 1000, 0);
+  assert.match(big.reason!, /^Prise de profit/);
+  // la perte coupée reste prioritaire en cas de trou de prix
+  assert.match(evaluateExit({ ...pos, id: 'b4' }, 0.97, 1000, 0).reason!, /^Perte coupée/);
 });
 
 test('entrée : acceptée si tout est bon, refusée sinon avec raisons', () => {
