@@ -247,6 +247,9 @@ export function scanIsDue(ageMs: number, intervalSeconds: number): boolean {
   return ageMs >= intervalSeconds * 1000 - SCAN_SLACK_MS;
 }
 
+/** Hausse maximale sur 5 min pour entrer : au-delà, c'est le sommet d'un pump. Vu le 14/11 : 3 achats à +16 / +18 / +32 % sur 5 min,
+ *  tous revendus 1 à 23 s plus tard entre −10 et −15 %. */
+export const ENTRY_MAX_M5_PCT = 10;
 export type EntrySettings = { max_risk_score: number; caution_level: 'low' | 'medium' | 'high' };
 export function evaluateEntry(pair: DexPair, risk: RiskResult, s: EntrySettings, priceAgeMs: number): { ok: boolean; reasons: string[] } {
   const why: string[] = [];
@@ -264,6 +267,7 @@ export function evaluateEntry(pair: DexPair, risk: RiskResult, s: EntrySettings,
   if ((pc?.h1 ?? 0) <= 0) why.push('Tendance 1 h non haussière');
   if ((pc?.h1 ?? 0) > 150) why.push('Hausse 1 h trop forte (risque de poursuite du pump)');
   if ((pc?.m5 ?? 0) <= 0) why.push('Ne monte pas en ce moment (5 min)');
+  if ((pc?.m5 ?? 0) > ENTRY_MAX_M5_PCT) why.push(`Hausse 5 min trop forte (+${pc?.m5} %) : on n’achète pas le sommet d’un pump`);
   const m5 = pair.txns?.m5;
   if (!m5 || m5.buys <= m5.sells) why.push('Pas plus d’acheteurs que de vendeurs sur 5 min');
   if ((pair.volume?.m5 ?? 0) < 1_000) why.push('Volume 5 min trop faible : le prix ne bouge pas');
